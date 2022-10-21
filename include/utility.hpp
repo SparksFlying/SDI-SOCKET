@@ -320,14 +320,14 @@ vector<vector<uint32_t>> read_from_syn_txt(uint64_t size=2000,int dim=2,const st
     unique(data);
 	return data;
 }
-template<class T1=double,class T2,class T3>
-void write_csv(vector<vector<T1>> arr,const vector<T2>& columns,const vector<T3>& index,const string& path){
-    //py::scoped_interpreter python;
-    py::module_ pd = py::module::import("pandas");
-    py::array_t<T1> nparr=py::cast(arr);//.cast<py::array_t<double>>();
-    py::object dataframe=pd.attr("DataFrame")(nparr,"columns"_a=columns,"index"_a=index);
-    dataframe.attr("to_csv")(path);
-}
+// template<class T1=double,class T2,class T3>
+// void write_csv(vector<vector<T1>> arr,const vector<T2>& columns,const vector<T3>& index,const string& path){
+//     //py::scoped_interpreter python;
+//     py::module_ pd = py::module::import("pandas");
+//     py::array_t<T1> nparr=py::cast(arr);//.cast<py::array_t<double>>();
+//     py::object dataframe=pd.attr("DataFrame")(nparr,"columns"_a=columns,"index"_a=index);
+//     dataframe.attr("to_csv")(path);
+// }
 
 
 //去重

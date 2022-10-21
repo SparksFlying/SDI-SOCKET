@@ -330,7 +330,7 @@ private:
         node* left_;
         node* right_;
         rb_color color_;
-        void* data_ptr;
+        std::shared_ptr<void> data_ptr;
     };
 //############################################################################################################
     template <typename node_type, typename owner_type>
@@ -728,8 +728,8 @@ private:
 
         // interface
         template <typename IntervalType = interval_type>
-        iterator insert(IntervalType&& ival,void* data_ptr){
-            iterator it=this->insert(ival);
+        iterator insert(IntervalType&& ival, std::shared_ptr<void> data_ptr){
+            iterator it = this->insert(ival);
             it.node_->data_ptr=data_ptr;
         }
         /**
@@ -1574,10 +1574,19 @@ private:
     public:
         node_type* root_;
         size_type size_;
-        void* data_ptr;
+        std::shared_ptr<void> data_ptr;
     };
 //############################################################################################################
 	template <typename T, typename Kind = closed>
 	using interval_tree_t = interval_tree <interval <T, Kind>>;
 //############################################################################################################
+    
+    // get height of the tree
+    int getHeight(interval_tree_t<uint64_t>::node_type* root) {
+        if (!root)
+            return 0;
+        int left_h = getHeight(root->left_);
+        int right_h = getHeight(root->right_);
+        return (left_h > right_h) ? (1 + left_h) : (1 + right_h);
+    }
 }
