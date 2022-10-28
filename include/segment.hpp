@@ -15,10 +15,11 @@ using std::string;
 using std::vector;
 using namespace ophelib;
 using namespace lib_interval_tree;
-//浮点数扩大到整数，如123.123456->123123456,放大倍数为1e6
+
+
 template<class FT = double, size_t factor = 30>
 std::string float2string(FT number){
-    char buf[factor];
+    char buf[factor + 1];
     sprintf(buf, string("%." + std::to_string(factor) + "f").c_str(), number);
     std::string s(buf);
     size_t dotpos = s.find('.');
@@ -30,7 +31,7 @@ std::string float2string(FT number){
 
 struct linearModel{
     double sl;
-    size_t b;
+    Integer b;
 };
 
 template<class KT=uint64_t,class PT=size_t,class FT=double>
@@ -91,7 +92,7 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
                     segs[0].start - 1
                 }, 
                 std::make_shared<pair<linearModel, linearModel>>(
-                    linearModel{segs[0].slope, segs[0].pos - size_t(segs[0].slope * segs[0].start)},
+                    linearModel{segs[0].slope, segs[0].pos},
                     linearModel{0, 0}
                 )
             );
@@ -100,11 +101,11 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
             segNodes.emplace_back(
                 interval<uint64_t, closed>{
                     segs[i].start, 
-                    segs[0].end
+                    segs[i].end
                 }, 
                 std::make_shared<pair<linearModel, linearModel>>(
-                    linearModel{segs[i].slope, segs[i].pos - size_t(segs[0].slope * segs[0].start)},
-                    linearModel{segs[i].slope, segs[i].pos - size_t(segs[0].slope * segs[0].start)}
+                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start)))},
+                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start)))}
                 )
             );
 			
@@ -116,8 +117,8 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
                             segs[i + 1].start - 1
                         }, 
                         std::make_shared<pair<linearModel, linearModel>>(
-                            linearModel{segs[i + 1].slope, segs[i + 1].pos - size_t(segs[i + 1].slope * segs[i + 1].start)},
-                            linearModel{segs[i].slope, segs[i].pos - size_t(segs[0].slope * segs[0].start)}
+                            linearModel{segs[i + 1].slope, Integer(segs[i + 1].pos) - Integer(int64_t(segs[i + 1].slope * double(segs[i + 1].start))) + Integer(int64_t(segs[i + 1].slope * double((segs[i + 1].start - (segs[i].end + 1)))))},
+                            linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start))) + Integer(int64_t(segs[i].slope * double(int64_t(segs[i].end) - int64_t(segs[i + 1].start - 1))))}
                         )
                     );
 				}
@@ -132,7 +133,7 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
                 }, 
                 std::make_shared<pair<linearModel, linearModel>>(
                     linearModel{0, std::numeric_limits<size_t>::max()},
-                    linearModel{segs.back().slope, segs.back().pos - size_t(segs.back().slope * segs.back().start)}
+                    linearModel{0, segs.back().pos + segs.back().len}
                 )
             );
         }
@@ -145,8 +146,8 @@ struct encSegmentNode{
     Ciphertext low_;
     Ciphertext high_;
     Ciphertext max_;
-    encSegmentNode* left_ = nullptr;
-    encSegmentNode* right_ = nullptr;
+    // encSegmentNode* left_ = nullptr;
+    // encSegmentNode* right_ = nullptr;
     std::pair<Ciphertext, Ciphertext> pred1;
     std::pair<Ciphertext, Ciphertext> pred2;
 
@@ -163,18 +164,18 @@ struct encSegmentNode{
         high_ = crypto.encrypt(node->high());
         max_ = crypto.encrypt(node->max());
 
-        initPredictor(pred1, expr->first);
-        initPredictor(pred2, expr->second);
+        initPredictor(crypto, pred1, expr->first);
+        initPredictor(crypto, pred2, expr->second);
     }
 
-    void initPredictor(std::pair<Ciphertext, Ciphertext>& pred, linearModel& m){
+    void initPredictor(const PaillierFast& crypto, std::pair<Ciphertext, Ciphertext>& pred, linearModel& m){
         string base = "1" + string(config::FLOAT_EXP, '0');
-        Integer sl(base.c_str());
-        sl *= m.sl;
+        Integer sl(float2string<double, config::FLOAT_EXP>(m.sl).c_str());
         Integer b(base.c_str());
         b *= m.b;
-        pred.first = std::move(sl);
-        pred.second = std::move(b);
+        
+        pred.first = std::move(crypto.encrypt(sl));
+        pred.second = std::move(crypto.encrypt(b));
 
         // pred = [](const ophelib::PaillierFast& crypto,const Ciphertext& input)->Ciphertext{
         //     // Ciphertext output=SM(crypto,e_sl,input).data*e_b.data;
@@ -184,11 +185,10 @@ struct encSegmentNode{
         //     // crypto.decrypt(output).to_string(false).c_str());
         //     // return output;
         // };
-        // if(config::){
-        //     printf("\n[sl=%s,b=%s]",sl.to_string(false).c_str(),
-        //             b.to_string(false).c_str());
-        //     ctree[i]->predictor(crypto,crypto.encrypt(1));
-        // }
+        if(config::DEBUG){
+            printf("\n[ori sl = %.30f,b = %lu]", m.sl, m.b);
+            printf("\n[exp sl = %s,b = %s]", sl.get_str().c_str(), b.get_str().c_str());
+        }
     }
 };
 
@@ -218,3 +218,11 @@ encSegmentNode* deSeriEncSegmentNode(const string& str){
     return node;
 }
 
+void printEncSegmentNode(PaillierFast* const crypto, const std::shared_ptr<encSegmentNode>& node){
+    printf("\n[low, high] = [%s, %s]\n", crypto->decrypt(node->low_).get_str().c_str(), crypto->decrypt(node->high_).get_str().c_str());
+    printf("[max] = [%s]\n", crypto->decrypt(node->max_).get_str().c_str());
+    pair<uint64_t, uint64_t> pred1{(crypto->decrypt(node->pred1.first) / Integer(10).pow(config::FLOAT_EXP)).to_ulong(), (crypto->decrypt(node->pred1.second) / Integer(10).pow(config::FLOAT_EXP)).to_ulong()};
+    pair<uint64_t, uint64_t> pred2{(crypto->decrypt(node->pred2.first) / Integer(10).pow(config::FLOAT_EXP)).to_ulong(), (crypto->decrypt(node->pred2.second) / Integer(10).pow(config::FLOAT_EXP)).to_ulong()};
+    printf("pred1 = [%lu, %lu]\n", pred1.first, pred1.second);
+    printf("pred2 = [%lu, %lu]\n", pred2.first, pred2.second);
+}

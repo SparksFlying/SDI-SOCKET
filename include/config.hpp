@@ -2,8 +2,10 @@
 #include<iostream>
 #include<map>
 #include<string>
+#include "logging.hpp"
 using std::map;
 using std::string;
+
 namespace config{
     constexpr uint32_t KEY_SIZE = 1024;
     constexpr size_t EPSILON = 32;
@@ -22,6 +24,8 @@ namespace config{
     constexpr bool INFO_NODE_PARAM = false;
     constexpr bool PADDING = true;
     constexpr bool PARAL = true;
+    constexpr bool DEBUG = false;
+    constexpr bool INFO = true;
 
     const string DO_IP = "127.0.0.1";
     const string DSP_IP = "127.0.0.1";

@@ -4,8 +4,10 @@
 #include <map>
 #include <iostream>
 #include <memory>
+#include <list>
 #include <rest_rpc.hpp>
 #include <libzinc/zinc.hh>
+#include <chrono>
 #include "config.hpp"
 #include "segment.hpp"
 #include "utility.hpp"
@@ -32,6 +34,7 @@ ENTITY_NAMESPACE_BEGIN
 #define RIGHT 1
 
 using std::vector;
+using std::list;
 using std::map;
 using std::string;
 using std::pair;
@@ -62,6 +65,7 @@ public:
 template<uint32_t dim = 2>
 class DO : public rpc_server{
 public:
+    string dataName;
     vector<record<dim>> data_;
     size_t epsilon_ = 32;
     PaillierFast* crypto;
@@ -70,9 +74,12 @@ public:
     // 对端通信实体
     rpc_client dap_;
     rpc_client dsp_;
+
+    // 日志系统
+    Log olog;
     //std::set<std::shared_ptr<AU>> users_;
 
-    DO(const vector<record<dim>>& data, int port = 10001, int thread_num = std::thread::hardware_concurrency()): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT) {
+    DO(const string& dataName, const vector<record<dim>>& data, int port = 10001, int thread_num = std::thread::hardware_concurrency()): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName), olog("DO") {
         
         // sort data according its morton code
         for(record<dim> item : data) {
@@ -88,6 +95,10 @@ public:
     }
 
     void outSource(){
+        // if(config::DEBUG){
+        //     auto idx = buildIndex();
+        // }
+
         std::future<vector<string>> index = std::async(&DO::buildIndex, this);
         std::future<vector<pair<size_t, vector<string>>>> encData = std::async(&DO::encryptData, this);
         
@@ -96,8 +107,8 @@ public:
 
         while(!dsp_.connect());
         // 发送数据和索引到DSP
-        dsp_.call("recvIndex", res1);
-        dsp_.call("recvData", res2);
+        dsp_.call("recvIndex", dataName, res1);
+        dsp_.call("recvData", dataName, res2);
     }
 
     vector<pair<size_t, vector<string>>> encryptData(){
@@ -198,88 +209,114 @@ public:
         PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
+        
     }
 };
 
 class DSP : public rpc_server{
 public:
-    DSP() : rpc_server(config::DSP_PORT, std::thread::hardware_concurrency()), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT){
+    DSP() : rpc_server(config::DSP_PORT, std::thread::hardware_concurrency()), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT), olog("DSP"){
         recvKeys();
-        while(!dap_.connect());
+        while(!dap_.connect()){
+            //std::this_thread::sleep_for(std::chrono::duration<int>(1));
+        }
 
         this->register_handler("recvData", &DSP::recvData, this);
         this->register_handler("recvIndex", &DSP::recvIndex, this);
         this->register_handler("rangeQuery", &DSP::rangeQuery, this);
-        this->register_handler("rangeQuery", &DSP::rangeQueryOpt, this);
+        this->register_handler("rangeQueryOpt", &DSP::rangeQueryOpt, this);
     }
 
     void recvKeys(){
         rpc_client cli(config::CA_IP, config::CA_PORT);
-        while(!cli.connect());
+        while(!cli.connect()){
+
+        }
         pair<string, string> param = cli.call<pair<string, string>>("getPub");
         array<string, 4> param2 = cli.call<array<string, 4>>("getPriv");
         PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
         PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
+        olog.infoLog("recv keys");
     }
 
-    void recvData(rpc_conn conn, vector<pair<size_t, vector<string>>>&& encData){
+    void recvData(rpc_conn conn, const string& dataName, vector<pair<size_t, vector<string>>>&& encData){
         string remoteIP = conn.lock()->remote_address();
-        std::cout << "\nfrom: " << remoteIP << std::endl;
-        std::cout << "recv data size: " << encData.size() << std::endl;
+        olog.infoLog("from " + remoteIP + " recv data size: " + std::to_string(encData.size()));
 
-        this->ip2data[remoteIP].resize(encData.size());
-        for(size_t i = 0; i < encData.size(); ++i){
-            this->ip2data[remoteIP][i].first = std::move(encData[i].first);
-            this->ip2data[remoteIP][i].second.resize(encData[i].second.size());
+        this->name2data[dataName].resize(encData.size());
+        auto iter = this->name2data[dataName].begin();
+        for(size_t i = 0; i < encData.size(); ++i, ++iter){
+            this->id2data[dataName][encData[i].first] = iter;
+            iter->resize(encData[i].second.size());
             for(size_t j = 0; j < encData[i].second.size(); ++j){
-                this->ip2data[remoteIP][i].second[j] = Integer(encData[i].second[j].c_str());
+                (*iter)[j] = Integer(encData[i].second[j].c_str());
             }
         }
     }
 
-    void recvIndex(rpc_conn conn, vector<string>&& index){
+    void recvIndex(rpc_conn conn, const string& dataName, vector<string>&& index){
         string remoteIP = conn.lock()->remote_address();
-        std::cout << "\nfrom: " << remoteIP << std::endl;
-        std::cout << "recv index size: " << index.size() << std::endl;
+        olog.infoLog("from " + remoteIP + " recv index size: " + std::to_string(index.size()));
 
-        this->ip2index[remoteIP].resize(index.size());
+        this->name2index[dataName].resize(index.size());
         for(size_t i = 0; i < index.size(); ++i){
-            this->ip2index[remoteIP][i].reset(deSeriEncSegmentNode(index[i]));
+            this->name2index[dataName][i].reset(deSeriEncSegmentNode(index[i]));
+        }
+        if(config::DEBUG){
+            for(size_t i = 0; i < index.size(); ++i){
+                printEncSegmentNode(crypto, this->name2index[dataName][i]);
+            }
         }
     }
 
-    vector<vector<uint32_t>> rangeQuery(rpc_conn conn, const pair<string, string>& range, const vector<string>& limits){
-        string remoteIP = conn.lock()->remote_address();
-        if(!ip2index.count(remoteIP)){
+    Ciphertext checkData(const string& dataName, const EQueryRectangle& QR, const size_t& id){
+        Ciphertext res = crypto->encrypt(0);
+        auto iter = this->id2data.find(dataName)->second.find(id)->second;
+        for(size_t i = 0; i < (*iter).size(); ++i){
+            Integer cmp = SM(SMinus((*iter)[i], QR.get_minvec()[i]), SMinus((*iter)[i], QR.get_maxvec()[i])).data;
+            res.data *= SIC(cmp.pow_mod_n(crypto->get_pub().n-1,*(crypto->get_n2())), crypto->encrypt(0)).data;
+        }
+        return res;
+	}
+
+    vector<vector<uint32_t>> rangeQuery(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        olog.infoLog("recv request from" + conn.lock()->remote_address());
+        if(!name2index.count(dataName)){
             return {};
         }
-        std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, ip2index[remoteIP], Ciphertext(Integer(range.first.c_str())));
-        std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, ip2index[remoteIP], Ciphertext(Integer(range.second.c_str())));
+        //std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())));
+        //std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())));
 
-        pair<Ciphertext, Ciphertext> posInfo{fut1.get(), fut2.get()}; 
-        Integer startPos(dap_.call<string>("DEC", posInfo.first.data.get_str()).c_str());
-        Integer endPos(dap_.call<string>("DEC", posInfo.second.data.get_str()).c_str());
+        //pair<Ciphertext, Ciphertext> posInfo{fut1.get(), fut2.get()}; 
+        pair<Ciphertext, Ciphertext> encPosInfo{CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0), CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1)};
+        Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
+        Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
 
-        // process postion info
+        char buf[50];
+        std::sprintf(buf, "predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
+        olog.debugLog(string(buf));
+
         {
             startPos /= Integer(10).pow(config::FLOAT_EXP);
-            startPos -= config::EPSILON;
-            startPos = startPos < 0 ? 0 : startPos;
+            startPos -= Integer(config::EPSILON);
+            if(startPos < 0) startPos = 0;
         }
         {
             endPos /= Integer(10).pow(config::FLOAT_EXP);
-            endPos += config::EPSILON;
-            endPos = endPos < ip2data[remoteIP].size() ? endPos : ip2data[remoteIP].size() - 1;
+            endPos += Integer(config::EPSILON);
+            if(endPos >= Integer(name2data[dataName].size())) endPos = Integer(name2data[dataName].size()) - 1;
         }
-        
+        pair<uint32_t, uint32_t> posInfo{startPos.to_uint(), endPos.to_uint()};
+
+        vector<vector<uint32_t>> ret{{posInfo.first, posInfo.second}};
         // search range [startPos, endPos]
-        
+        return ret;
     }
 
-    void rangeQueryOpt(rpc_conn conn, const pair<string, string>& range, const vector<string>& limits){
-
+    vector<vector<uint32_t>> rangeQueryOpt(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        return {};
     }
 
     // secure multiply protocol
@@ -299,26 +336,26 @@ public:
     }
 
     // res=E(a-b)
-    Ciphertext SMinus(const Ciphertext& a,const Ciphertext& b){
+    Ciphertext SMinus(const Ciphertext& a,const Ciphertext& b) {
         return a.data * b.data.pow_mod_n(crypto->get_pub().n - 1, *(crypto->get_n2()));
     }
 
     // E(res)=E(a|b)
     // res=a+b-a*b
-    Ciphertext SOR(const Ciphertext& a,const Ciphertext& b){
+    Ciphertext SOR(const Ciphertext& a,const Ciphertext& b) {
         return SMinus(a.data * b.data, SM(a, b));
     }
 
     // res = times*a
-    Ciphertext _times(const Ciphertext& a, Integer times){
+    Ciphertext _times(const Ciphertext& a, Integer times) {
         return a.data.pow_mod_n(times, *(crypto->get_n2()));
     }
 
     // Secure Integer Comparison Protocol
     // 当a<=b return 1,否则return 0
-    Ciphertext SIC(const Ciphertext& a, const Ciphertext& b){
+    Ciphertext SIC(const Ciphertext& a, const Ciphertext& b) {
         Ciphertext X = _times(a, 2);
-        Ciphertext Y = _times(b, 2);
+        Ciphertext Y = _times(b, 2).data * crypto->encrypt(1).data;
         Integer coin = Random::instance().rand_int(crypto->get_pub().n) % Integer(2);
         Ciphertext Z;
         if(coin == 1){
@@ -332,6 +369,9 @@ public:
         Ciphertext c = _times(Z, r);
 
         Ciphertext ret = Integer(dap_.call<string>("SIC", c.data.get_str()).c_str());
+        if(coin == 0){
+            ret = SMinus(crypto->encrypt(1), ret);
+        }
         return ret;
     }
 
@@ -357,16 +397,24 @@ public:
     }
 
 
-    Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input){
+    Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input, bool whichPred = 0){
+        char buf[30];
+        std::sprintf(buf, "input = %s", crypto->decrypt(input).get_str().c_str());
+        olog.debugLog(string(buf));
+
         Ciphertext P = crypto->encrypt(0);
         Ciphertext F = crypto->encrypt(0);
 
         size_t cur = 0;
         while(cur < index.size()){
             Ciphertext f = SCO(index[cur], input);
-            Ciphertext acc = SM(index[cur]->pred1.first, input).data * index[cur]->pred1.second.data;
+            Ciphertext acc = whichPred == 0 ? SM(index[cur]->pred1.first, input).data * index[cur]->pred1.second.data : SM(index[cur]->pred2.first, input).data * index[cur]->pred2.second.data;
             F.data *= f.data; 
-            P.data *= SM(F, acc).data;
+            P.data *= SM(f, acc).data;
+
+            std::sprintf(buf, "cur = %lu, F = %s, P = %s", cur, crypto->decrypt(f).get_str().c_str(), (crypto->decrypt(P) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
+            olog.debugLog(string(buf));
+
             if(SPFT(index, cur, F, input) == LEFT){
                 cur = 2 * cur + 1;
             }else{
@@ -379,14 +427,23 @@ public:
 public:
     PaillierFast* crypto;
     rpc_client dap_;
-    map<string, vector<pair<size_t, vector<Ciphertext>>>> ip2data;
-    map<string, vector<shared_ptr<encSegmentNode>>> ip2index;
+
+    // dataname to data
+    map<string, list<vector<Ciphertext>>> name2data;
+    // dataname to index
+    map<string, vector<shared_ptr<encSegmentNode>>> name2index;
+    // data id to iterator of data
+    map<string, map<size_t, list<vector<Ciphertext>>::iterator>> id2data;
+
+
+    // 日志系统
+    Log olog;
 };
 
 class DAP : public rpc_server{
 public:
 
-    DAP() : rpc_server(config::DAP_PORT, std::thread::hardware_concurrency()), dsp_(config::DSP_IP, config::DSP_PORT){
+    DAP() : rpc_server(config::DAP_PORT, std::thread::hardware_concurrency()), dsp_(config::DSP_IP, config::DSP_PORT), olog("DAP"){
         recvKeys();
 
         // regist
@@ -416,7 +473,7 @@ public:
         return crypto->decrypt(Integer(c.c_str())).get_str();
     }
 
-private:
+public:
     PaillierFast* crypto;
     rpc_client dsp_;
     void recvKeys(){
@@ -427,28 +484,86 @@ private:
         PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
         PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
-        // std::cout << param.first << std::endl;
-        // std::cout << param.second << std::endl;
-        // std::cout << param2.first << std::endl;
-        // std::cout << param2.second << std::endl; 
         crypto = new PaillierFast(pk, sk);
+        olog.infoLog("recv keys");
     }
-    
+    // 日志系统
+    Log olog;
 };
 
-class AU : public rpc_client{
-    
+class AU {
+public:
+    AU(){
+        recvPubKey();
+    }
+
+    void recvPubKey(){
+        rpc_client ca(config::CA_IP, config::CA_PORT);
+        while(!ca.connect());
+        
+        pair<string, string> param = ca.call<pair<string, string>>("getPub");
+        PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        crypto = new PaillierFast(pk);
+    }
+    void query(const QueryRectangle<uint32_t>& QR){
+        rpc_client dsp_(config::DSP_IP, config::DSP_PORT);
+        while(!dsp_.connect());
+        pair<uint64_t, uint64_t> range{};
+        vector<string> limits(QR.dim * 2);
+
+        switch(QR.dim){
+            case 2:{
+                range.first = morton_code<2, 32>::encode(vec2arr<uint32_t, 2>(QR.get_minvec()));
+                range.second = morton_code<2, 32>::encode(vec2arr<uint32_t, 2>(QR.get_maxvec()));
+                break;
+            }
+            case 3:{
+                range.first = morton_code<3, 21>::encode(vec2arr<uint32_t, 3>(QR.get_minvec()));
+                range.second = morton_code<3, 21>::encode(vec2arr<uint32_t, 3>(QR.get_maxvec()));
+                break;
+            }
+            case 4:{
+                range.first = morton_code<4, 16>::encode(vec2arr<uint32_t, 4>(QR.get_minvec()));
+                range.second = morton_code<4, 16>::encode(vec2arr<uint32_t, 4>(QR.get_maxvec()));
+                break;
+            }
+            case 5:{
+                range.first = morton_code<5, 12>::encode(vec2arr<uint32_t, 5>(QR.get_minvec()));
+                range.second = morton_code<5, 12>::encode(vec2arr<uint32_t, 5>(QR.get_maxvec()));
+                break;
+            }
+            case 6:{
+                range.first = morton_code<6, 10>::encode(vec2arr<uint32_t, 6>(QR.get_minvec()));
+                range.second = morton_code<6, 10>::encode(vec2arr<uint32_t, 6>(QR.get_maxvec()));
+                break;
+            }
+        }
+
+        // encrypt
+
+        for(size_t i = 0; i < QR.dim; ++i){
+            limits[i] = crypto->encrypt(QR.get_minvec()[i]).data.get_str();
+            limits[i + QR.dim] = crypto->encrypt(QR.get_maxvec()[i]).data.get_str();
+        }
+        pair<string, string> encRange{crypto->encrypt(range.first).data.get_str(), crypto->encrypt(range.second).data.get_str()};
+        string dataName = "test";
+        //vector<vector<uint32_t>> res = dsp_.call<vector<vector<uint32_t>>>("rangeQuery", dataName, encRange, limits);
+        auto fut = dsp_.async_call<FUTURE>("rangeQuery", dataName, encRange, limits);
+        vector<vector<uint32_t>> res = fut.get().as<vector<vector<uint32_t>>>();
+        if(!res.empty()){
+            std::cout << res[0][0] << ", " << res[0][1] << std::endl;
+        }else{
+            std::cout << "empty" << std::endl;
+        }
+    }
+private:
+    PaillierFast* crypto;
 };
 
 class CA : public rpc_server{
 public:
-    CA(const uint32_t key_size = config::KEY_SIZE) : rpc_server(config::CA_PORT, 1), crypto(new PaillierFast(key_size)){
+    CA(const uint32_t key_size = config::KEY_SIZE) : rpc_server(config::CA_PORT, 1), crypto(new PaillierFast(key_size)), olog("CA"){
         crypto->generate_keys();
-        std::cout << crypto->get_pub().n.get_str() << std::endl;
-        std::cout << crypto->get_pub().g.get_str() << std::endl;
-        std::cout << crypto->get_priv().key_size_bits << std::endl;
-        std::cout << crypto->get_priv().p.get_str() << std::endl;
-        std::cout << crypto->get_priv().q.get_str() << std::endl;
         this->register_handler("getPub", &CA::getPub, this);
         this->register_handler("getPriv", &CA::getPriv, this);
     }
@@ -461,6 +576,8 @@ public:
 
 private:
     PaillierFast* crypto;
+    // 日志系统
+    Log olog;
 };
 
 ENTITY_NAMESPACE_END

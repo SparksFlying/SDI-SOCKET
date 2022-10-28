@@ -3,7 +3,7 @@
         {
             "type": "shell",
             "label": "build",
-            "command": "cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make",
+            "command": "cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make -j",
             "group": {
                 "kind": "build",
                 "isDefault": true
