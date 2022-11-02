@@ -1,15 +1,16 @@
 #pragma once
-#include<iostream>
-#include<map>
-#include<string>
-#include "logging.hpp"
+#include <iostream>
+#include <map>
+#include <string>
 using std::map;
 using std::string;
 
 namespace config{
+    const string workspaceFolder = "/home/zanglang/source/SDI/";
     constexpr uint32_t KEY_SIZE = 1024;
-    constexpr size_t EPSILON = 32;
+    constexpr size_t EPSILON = 64;
     constexpr uint64_t SIZE = 1000;
+    constexpr size_t MAX_SEGMENT_SIZE = 300;
     const map<int,int> dim_bitperdim_table{
         {1, 64},
         {2, 32},

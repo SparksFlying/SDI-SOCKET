@@ -9,6 +9,7 @@
 #include <functional>
 #include "config.hpp"
 #include "utility.hpp"
+#include "logging.hpp"
 #include "/usr/lib/gcc/x86_64-linux-gnu/12/include/omp.h"
 
 using std::pair;
@@ -227,6 +228,11 @@ void printEncSegmentNode(PaillierFast* const crypto, const std::shared_ptr<encSe
     printf("pred1 = [%lu, %lu]\n", pred1.first, pred1.second);
     printf("pred2 = [%lu, %lu]\n", pred2.first, pred2.second);
 }
+
+struct TreeNode{
+    size_t nodeIdx;
+    
+};
 
 
 // pgm segment algorithm

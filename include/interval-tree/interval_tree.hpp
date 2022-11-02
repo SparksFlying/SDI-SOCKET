@@ -1417,7 +1417,7 @@ private:
             else
                 x->max_ = std::max(x->interval_.high(), y->max_);
         }
-
+public:
         void recalculate_max(node_type* reacalculation_root)
         {
             auto* p = reacalculation_root;
@@ -1430,7 +1430,7 @@ private:
                 p = p->parent_;
             }
         }
-
+private:
         void insert_fixup(node_type* z)
         {
             while (z->parent_ && z->parent_->color_ == rb_color::red)

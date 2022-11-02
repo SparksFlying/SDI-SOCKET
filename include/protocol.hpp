@@ -11,6 +11,7 @@
 #include <pybind11/pybind11.h>
 #include "config.hpp"
 #include "utility.hpp"
+#include "logging.hpp"
 using namespace ophelib;
 using std::vector;
 

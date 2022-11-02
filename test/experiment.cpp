@@ -7,7 +7,7 @@ using std::vector;
 using std::string;
 
 vector<record<2>> getData(){
-    size_t size = 10000;
+    size_t size = 100000;
     vector<record<2>> data(size);
     for(size_t i = 0; i < size; ++i){
         data[i].id = i;
@@ -15,7 +15,7 @@ vector<record<2>> getData(){
         data[i].value  = nullptr;
     }
 
-    // QueryRectangle<uint32_t> QR(std::vector<uint32_t>{10, 10, 1000, 1000});
+    // QueryRectangle<uint32_t> QR(std::vector<uint32_t>{4500, 4500, 5000, 5000});
     // for(size_t i = 0; i < size; ++i){
     //     if(QR.isFallin<2>(data[i].key)){
     //         std::cout << i << " ";
@@ -89,7 +89,7 @@ int run(int argc, char* argv[]){
     }else if(entityType == "AU" || entityType == "au"){
         Log::instance("AU").setLevel(logging::trivial::severity_level::debug);
         Entity::AU au;
-        au.query(QueryRectangle<uint32_t>(std::vector<uint32_t>{10, 10, 100, 100}));
+        au.query(QueryRectangle<uint32_t>(std::vector<uint32_t>{4500, 4500, 5000, 5000}));
     }
     return 0;
 }

@@ -25,6 +25,7 @@
 #include <boost/date_time/posix_time/posix_time_types.hpp>
 #include <boost/log/support/date_time.hpp>
 #include <boost/log/utility/setup/file.hpp>
+#include "config.hpp"
  
 namespace logging = boost::log;
 namespace expr = boost::log::expressions;
@@ -170,7 +171,7 @@ Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
  
 	typedef sinks::synchronous_sink< sinks::text_file_backend > text_sink;
 	boost::shared_ptr< sinks::text_file_backend > backend = boost::make_shared< sinks::text_file_backend >(
-			keywords::file_name = sLogFilePfx + "_%N.log", 
+			keywords::file_name = config::workspaceFolder +  sLogFilePfx + "_%N.log", 
 			keywords::rotation_size = nRotSizeInByte,
 			keywords::open_mode = std::ios_base::app
 		);
