@@ -10,13 +10,15 @@
                 "/usr/local/include/pybind11",
                 "/usr/include/python3.10",
                 "/usr/local/include",
-                "${workspaceFolder}/test"
+                "${workspaceFolder}/test",
+                "/usr/lib/gcc/x86_64-linux-gnu/12/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",
             "cStandard": "c17",
             "intelliSenseMode": "linux-clang-x64",
-            "configurationProvider": "ms-vscode.cmake-tools"
+            "configurationProvider": "ms-vscode.cmake-tools",
+            "cppStandard": "c++17"
         }
     ],
     "version": 4

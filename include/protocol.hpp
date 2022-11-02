@@ -1,7 +1,6 @@
 #pragma once
 #include "ophelib/paillier_fast.h"
 #include "ophelib/vector.h"
-#include "ophelib/omp_wrap.h"
 #include "ophelib/packing.h"
 #include "ophelib/util.h"
 #include "ophelib/ml.h"
@@ -11,9 +10,9 @@
 #include <pybind11/eval.h>
 #include <pybind11/pybind11.h>
 #include "config.hpp"
-namespace py = pybind11;
+#include "utility.hpp"
 using namespace ophelib;
-
+using std::vector;
 
 inline Integer getMaxBitLength(const Integer& a){
 	return a.size_bits();
@@ -26,6 +25,13 @@ public:
 		for(size_t i = 0; i < dim; ++i){
 			minvec[i] = vals[i];
 			maxvec[i] = vals[i + dim];
+		}
+	}
+
+	EQueryRectangle(const vector<string>& vals) : dim(vals.size() / 2), minvec(vector<Ciphertext>(dim)), maxvec(vector<Ciphertext>(dim)){
+		for(size_t i = 0; i < dim; ++i){
+			minvec[i].data = Integer(vals[i].c_str());
+			maxvec[i].data = Integer(vals[i + dim].c_str());
 		}
 	}
     

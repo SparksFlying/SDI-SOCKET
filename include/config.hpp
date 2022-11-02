@@ -20,12 +20,7 @@ namespace config{
     };
 
     constexpr size_t FLOAT_EXP = 30;
-    constexpr bool TRACK_CALC = false;
-    constexpr bool INFO_NODE_PARAM = false;
-    constexpr bool PADDING = true;
-    constexpr bool PARAL = true;
-    constexpr bool DEBUG = false;
-    constexpr bool INFO = true;
+    constexpr bool LOG = true;
 
     const string DO_IP = "127.0.0.1";
     const string DSP_IP = "127.0.0.1";

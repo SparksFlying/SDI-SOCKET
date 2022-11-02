@@ -76,5 +76,9 @@
         "typeinfo": "cpp",
         "variant": "cpp",
         "*.ipp": "cpp"
-    }
+    },
+    "editor.inlayHints.enabled": "off",
+    "C_Cpp.intelliSenseEngine": "Disabled",
+    "clangd.arguments": [ "--header-insertion=never" ],
+    "clangd.fallbackFlags": [ "-std=c++17" ]
 }

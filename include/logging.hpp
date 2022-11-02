@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <map>
 #include <boost/log/sources/severity_logger.hpp>
 #include <boost/log/attributes.hpp>
 #include <boost/log/attributes/scoped_attribute.hpp>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <codecvt>
+#include <mutex>
 #include <boost/smart_ptr/shared_ptr.hpp>
 #include <boost/smart_ptr/make_shared_object.hpp>
 #include <boost/locale/generator.hpp>
@@ -25,56 +27,135 @@
 #include <boost/log/utility/setup/file.hpp>
  
 namespace logging = boost::log;
-namespace src = boost::log::sources;
 namespace expr = boost::log::expressions;
 namespace sinks = boost::log::sinks;
 namespace attrs = boost::log::attributes;
 namespace keywords = boost::log::keywords;
- 
+
 using std::string;
- 
+using std::map;
 BOOST_LOG_ATTRIBUTE_KEYWORD(tag_attr, "Tag", std::string)
 BOOST_LOG_ATTRIBUTE_KEYWORD(scope, "Scope", attrs::named_scope::value_type)
 BOOST_LOG_ATTRIBUTE_KEYWORD(timeline, "Timeline", attrs::timer::value_type)
 BOOST_LOG_ATTRIBUTE_KEYWORD(thread_id, "ThreadID", attrs::current_thread_id::value_type)
+
+#define debug(format, ...) \
+    Log::instance().log(logging::trivial::severity_level::debug, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+
+#define info(format, ...) \
+    Log::instance().log(logging::trivial::severity_level::info, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+
+#define warn(format, ...) \
+    Log::instance().log(logging::trivial::severity_level::warning, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+
+#define error(format, ...) \
+    Log::instance().log(logging::trivial::severity_level::error, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+
+#define fatal(format, ...) \
+    Log::instance().log(logging::trivial::severity_level::fatal, __FUNCTION__, __LINE__, format, ##__VA_ARGS__)
+
+
+static std::map<logging::trivial::severity_level, string> level2str{
+	{logging::trivial::severity_level::debug, "DEBUG"},
+	{logging::trivial::severity_level::info, "INFO"},
+	{logging::trivial::severity_level::warning, "WARNING"},
+	{logging::trivial::severity_level::error, "ERROR"},
+	{logging::trivial::severity_level::fatal, "FATAL"}
+
+};
+
 class Log
 {
 public:
-	Log(const std::string &sLogFilePfx = "Log", const unsigned int nRotSize = 5 * 1024 * 1024);
-	~Log();
- 
-	void fatalLog(const std::wstring & wsTxt);
-	void errorLog(const std::wstring & wsTxt);
-	void warningLog(const std::wstring & wsTxt);
-	void infoLog(const std::wstring & wsTxt);
-	void debugLog(const std::wstring & wsTxt);
-	void traceLog(const std::wstring & wsTxt);
+	
+	static Log& instance(const string& prefix = "Log")
+	{
+		static Log olog(prefix);
+		return olog;
+		// if(m_instance == nullptr){
+		// 	m_mutex.lock();
+		// 	if(m_instance == nullptr)
+		// 	{
+		// 		m_instance = new Log(prefix);
+		// 	}
+		// 	m_mutex.unlock();
+		// }
+		// return *m_instance;
+	}
+	
+	void setLogFilePrefix(const string& prefix = "Log")
+	{
+
+	}
+
+	void setLevel(logging::trivial::severity_level level){
+		this->m_level = level;
+	}
+
+	void log(logging::trivial::severity_level level, const char* file, int line, const char* format, ...)
+	{
+		if (m_level > level)
+		{
+			return;
+		}
+		string content = "";
+
+		int len = 0;
+		len = snprintf(NULL, 0, "%s | %s | %d | ", level2str[level].c_str(), file, line);
+		if(len > 0)
+		{
+			char * buffer = new char[len + 1];
+			snprintf(buffer, len + 1, "%s | %s | %d | ", level2str[level].c_str(), file, line);
+			buffer[len] = 0;
+			content += buffer;
+			delete buffer;
+		}
+		
+		va_list arg_ptr;
+		va_start(arg_ptr, format);
+		len = vsnprintf(NULL, 0, format, arg_ptr);
+		va_end(arg_ptr);
+
+		if (len > 0)
+		{
+			char * buffer = new char[len + 1];
+			va_start(arg_ptr, format);
+			vsnprintf(buffer, len + 1, format, arg_ptr);
+			va_end(arg_ptr);
+			buffer[len] = 0;
+			content += buffer;
+			delete buffer;
+		}
+		internLog(toWideString(content), level);
+
+		// if(level == logging::trivial::severity_level::debug)
+		// {
+		// 	std::cout << content << std::endl;
+		// }
+	}
 
 	inline std::wstring toWideString(const std::string& input)
 	{
 		return converter.from_bytes(input);
 	}
 
-	void infoLog(const std::string& txt){
-		infoLog(toWideString(txt));
-	}
-
-	void debugLog(const std::string& txt){
-		debugLog(toWideString(txt));
-	}
  
 	#define M_LOG_USE_TIME_LINE BOOST_LOG_SCOPED_THREAD_ATTR("Timeline", boost::log::attributes::timer());
 	#define M_LOG_USE_NAMED_SCOPE(named_scope) BOOST_LOG_NAMED_SCOPE(named_scope);
  
 private:
+	Log(const std::string &logFilePrefix = "Log", const unsigned int nRotSize = 5 * 1024 * 1024);
+	~Log();
 	void internLog(const std::wstring & wsTxt, const boost::log::trivial::severity_level eSevLev);
 	boost::log::sources::wseverity_logger_mt<boost::log::trivial::severity_level> m_oWsLogger;
 	std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+	logging::trivial::severity_level m_level = logging::trivial::severity_level::debug;
+	static Log* m_instance;
+	static std::mutex m_mutex;
 };
 
- 
-
- 
+Log* Log::m_instance = nullptr;
+std::mutex Log::m_mutex;
  
 Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
 {
@@ -93,25 +174,13 @@ Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
 			keywords::rotation_size = nRotSizeInByte,
 			keywords::open_mode = std::ios_base::app
 		);
- 
 	boost::shared_ptr< text_sink > sink(new text_sink(backend));
  
 	sink->set_formatter
 	(
 		expr::stream
 		<< expr::format_date_time< boost::posix_time::ptime >("TimeStamp", "%Y-%m-%d %H:%M:%S") << " | "
-		<< logging::trivial::severity << "\t| "
-		<< thread_id << " | "
-		<< "(" << scope << ") "
-		<< expr::if_(expr::has_attr(tag_attr))
-		[
-			expr::stream << "[" << tag_attr << "] "
-		]
-	<< expr::if_(expr::has_attr(timeline))
-		[
-			expr::stream << "[" << timeline << "] "
-		]
-	<< expr::message
+		<< expr::message
 		);
  
 	// The sink will perform character code conversion as needed, according to the locale set with imbue()
@@ -127,68 +196,9 @@ Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
  
 Log::~Log()
 {
+
 }
- 
-void Log::fatalLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::fatal);
-}
- 
-void Log::errorLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::error);
-}
- 
-void Log::warningLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::warning);
-}
- 
-void Log::infoLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::info);
-}
- 
-void Log::debugLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::debug);
-}
- 
-void Log::traceLog(const std::wstring & wsTxt)
-{
-	if (wsTxt.empty())
-	{
-		return;
-	}
- 
-	internLog(wsTxt, logging::trivial::trace);
-}
- 
+
 void Log::internLog(const std::wstring & wsTxt, const logging::trivial::severity_level eSevLev)
 {
 	if (wsTxt.empty())

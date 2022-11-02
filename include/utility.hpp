@@ -378,6 +378,15 @@ public:
 		}
 		return true;
 	}
+	template<uint32_t dim>
+	bool isFallin(const std::array<KT, dim>& p)const{
+		for(auto i=0;i<dim;++i){
+			if(p[i]<minvec[i]||p[i]>maxvec[i]){
+				return false;
+			}
+		}
+		return true;
+	}
 public:
 	int dim;
 private:

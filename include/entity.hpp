@@ -15,14 +15,14 @@
 #include <thread>
 #include "ophelib/paillier_fast.h"
 #include "ophelib/vector.h"
-#include "ophelib/omp_wrap.h"
 #include "ophelib/packing.h"
 #include "ophelib/util.h"
 #include "ophelib/ml.h"
 #include "ophelib/random.h"
-#include "utility.hpp"
 #include "protocol.hpp"
 #include <cmath>
+#include <sstream>
+#include <mutex>
 
 #define ENTITY_NAMESPACE_BEGIN namespace Entity{
 #define ENTITY_NAMESPACE_END };
@@ -40,6 +40,9 @@ using std::string;
 using std::pair;
 using std::array;
 using std::shared_ptr;
+using std::stringstream;
+using std::mutex;
+using std::lock_guard;
 using namespace lib_interval_tree;
 using namespace rest_rpc;
 using namespace rpc_service;
@@ -75,11 +78,9 @@ public:
     rpc_client dap_;
     rpc_client dsp_;
 
-    // 日志系统
-    Log olog;
     //std::set<std::shared_ptr<AU>> users_;
 
-    DO(const string& dataName, const vector<record<dim>>& data, int port = 10001, int thread_num = std::thread::hardware_concurrency()): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName), olog("DO") {
+    DO(const string& dataName, const vector<record<dim>>& data, int port = 10001, int thread_num = std::thread::hardware_concurrency()): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName){
         
         // sort data according its morton code
         for(record<dim> item : data) {
@@ -93,22 +94,90 @@ public:
         // 接收秘钥
         recvKeys();
     }
+    // 分块序列化加密数据
+    vector<pair<pair<size_t, size_t>, string>> seriEncData(vector<pair<size_t, vector<string>>>& encData, const size_t blockSize = MAX_BUF_LEN - 10)
+    {
+        vector<pair<pair<size_t, size_t>, string>> ret;
+        stringstream ss;
+        size_t pre = 0;
+        for(size_t i = 0; i < encData.size(); ++i)
+        {
+            size_t len = sizeof(encData[i].first);
+            for(auto& str : encData[i].second)
+            {
+                len += str.size();
+            }
+            if(ss.str().size() + len >= blockSize - 16)
+            {
+                ret.push_back(pair<pair<size_t, size_t>, string>{{pre, i}, std::move(ss.str())});
+                ss.str("");
+                pre = i;
+            }
+            ss << std::move(encData[i].first) << " ";
+            for(auto& str : encData[i].second)
+            {
+                ss << std::move(str) << " ";
+            }
+        }
+        ret.push_back(pair<pair<size_t, size_t>, string>{{pre, encData.size()}, std::move(ss.str())});
+        return ret;
+    }
 
-    void outSource(){
-        // if(config::DEBUG){
-        //     auto idx = buildIndex();
-        // }
+    // 分块序列化索引
+    vector<pair<pair<size_t, size_t>, string>> seriIndex(vector<string>& index, const size_t blockSize = MAX_BUF_LEN - 10)
+    {
+        vector<pair<pair<size_t, size_t>, string>> ret;
+        stringstream ss;
+        size_t pre = 0;
+        for(size_t i = 0; i < index.size(); ++i)
+        {
+            if(ss.str().size() + index[i].size() >= blockSize - 16)
+            {
+                ret.push_back(pair<pair<size_t, size_t>, string>{{pre, i}, std::move(ss.str())});
+                ss.str("");
+                pre = i;
+            }
+            ss << std::move(index[i]) << " ";
+        }
+        ret.push_back(pair<pair<size_t, size_t>, string>{{pre, index.size()}, std::move(ss.str())});
+        return ret;
+    }
 
-        std::future<vector<string>> index = std::async(&DO::buildIndex, this);
-        std::future<vector<pair<size_t, vector<string>>>> encData = std::async(&DO::encryptData, this);
+    void outSource()
+    {
+        //auto idx = buildIndex();
+        vector<pair<pair<size_t, size_t>, string>> encDataBlocks;
+        vector<pair<pair<size_t, size_t>, string>> indexBlocks;
+        {
+            // std::future<vector<string>> res1 = std::async(&DO::buildIndex, this);
+            // std::future<vector<pair<size_t, vector<string>>>> res2 = std::async(&DO::encryptData, this);
+            
+            // auto index = res1.get();
+            // auto encData = res2.get();
+            auto index = buildIndex();
+            auto encData = encryptData();
+
+            encDataBlocks = seriEncData(encData);
+            indexBlocks = seriIndex(index);
+        }
         
-        auto res1 = index.get();
-        auto res2 = encData.get();
 
         while(!dsp_.connect());
-        // 发送数据和索引到DSP
-        dsp_.call("recvIndex", dataName, res1);
-        dsp_.call("recvData", dataName, res2);
+
+        dsp_.call("recvDataInfo", dataName, this->data_.size(), dim);
+        dsp_.call("recvIndexInfo", dataName, plainIndex.size());
+
+        // 分批发送数据
+        for(size_t i = 0; i < encDataBlocks.size(); ++i)
+        {
+            dsp_.async_call<FUTURE>("recvData", dataName, encDataBlocks[i]);
+        }
+
+        // 分批发送索引
+        for(size_t i = 0; i < indexBlocks.size(); ++i)
+        {
+            dsp_.async_call<FUTURE>("recvIndex", dataName, indexBlocks[i]);
+        }
     }
 
     vector<pair<size_t, vector<string>>> encryptData(){
@@ -135,15 +204,13 @@ public:
     }
 
     void buildTree(interval_tree_t<uint64_t>& tree){
-        vector<uint64_t> keys(data_.size());
-        vector<size_t> poses(data_.size());
-
+        vector<int64_t> keys(data_.size());
         for(size_t idx = 0; idx < data_.size(); ++idx){
             keys[idx] = mortonTable_[data_[idx].id];
-            poses[idx] = data_[idx].id;
         }
+        vector<segment<uint64_t, size_t, double>> segs = pgm::transform(keys, pgm::fit<int64_t, size_t>(keys, epsilon_));
+        //vector<segment<uint64_t, size_t, double>> segs = shringkingCone<int64_t, size_t>(keys, epsilon_);
 
-        vector<segment<uint64_t, size_t, double>> segs = shringkingCone<uint64_t, size_t>(keys, poses, epsilon_);
         std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, linearModel>>>> segNodes = paddingSegments(segs);
         
         for(auto& node : segNodes){
@@ -215,7 +282,7 @@ public:
 
 class DSP : public rpc_server{
 public:
-    DSP() : rpc_server(config::DSP_PORT, std::thread::hardware_concurrency()), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT), olog("DSP"){
+    DSP() : rpc_server(config::DSP_PORT, std::thread::hardware_concurrency()), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT){
         recvKeys();
         while(!dap_.connect()){
             //std::this_thread::sleep_for(std::chrono::duration<int>(1));
@@ -225,6 +292,8 @@ public:
         this->register_handler("recvIndex", &DSP::recvIndex, this);
         this->register_handler("rangeQuery", &DSP::rangeQuery, this);
         this->register_handler("rangeQueryOpt", &DSP::rangeQueryOpt, this);
+        this->register_handler("recvDataInfo", &DSP::recvDataInfo, this);
+        this->register_handler("recvIndexInfo", &DSP::recvIndexInfo, this);
     }
 
     void recvKeys(){
@@ -238,34 +307,59 @@ public:
         PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
-        olog.infoLog("recv keys");
+        info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
     }
 
-    void recvData(rpc_conn conn, const string& dataName, vector<pair<size_t, vector<string>>>&& encData){
-        string remoteIP = conn.lock()->remote_address();
-        olog.infoLog("from " + remoteIP + " recv data size: " + std::to_string(encData.size()));
-
-        this->name2data[dataName].resize(encData.size());
+    void recvDataInfo(rpc_conn conn, const string& dataName, const size_t dataSize, const uint32_t dim)
+    {
+        lock_guard g(m_n2d);
+        this->name2data[dataName].resize(dataSize);
         auto iter = this->name2data[dataName].begin();
-        for(size_t i = 0; i < encData.size(); ++i, ++iter){
-            this->id2data[dataName][encData[i].first] = iter;
-            iter->resize(encData[i].second.size());
-            for(size_t j = 0; j < encData[i].second.size(); ++j){
-                (*iter)[j] = Integer(encData[i].second[j].c_str());
+        for(size_t i = 0; i < dataSize; ++i, ++iter){
+            iter->resize(dim);
+        }
+    }
+
+    void recvIndexInfo(rpc_conn conn, const string& dataName, const size_t indexSize)
+    {
+        lock_guard g(m_n2i);
+        this->name2index[dataName].resize(indexSize);
+    }
+
+    void recvData(rpc_conn conn, const string& dataName, pair<pair<size_t, size_t>, string>&& encData)
+    {
+        string remoteIP = conn.lock()->remote_address();
+        debug("from %s recv dataset %s , block from %lu to %lu", remoteIP.c_str(), dataName.c_str(), encData.first.first, encData.first.second);
+        stringstream ss(encData.second);
+        auto iter = std::prev(this->name2data[dataName].begin(), encData.first.first);
+        for(size_t i = encData.first.first; i < encData.first.second; ++i, ++iter)
+        {
+            size_t id;
+            ss >> id;
+            this->id2data[dataName][id] = iter;
+            string buf;
+            for(size_t j = 0; j < (*iter).size(); ++j){
+                ss >> buf;
+                (*iter)[j] = Integer(buf.c_str());
             }
         }
     }
 
-    void recvIndex(rpc_conn conn, const string& dataName, vector<string>&& index){
+    void recvIndex(rpc_conn conn, const string& dataName, pair<pair<size_t, size_t>, string>&& index){
         string remoteIP = conn.lock()->remote_address();
-        olog.infoLog("from " + remoteIP + " recv index size: " + std::to_string(index.size()));
+        debug("from %s recv index for dataset %s , block from %lu to %lu", remoteIP.c_str(), dataName.c_str(), index.first.first, index.first.second);
 
-        this->name2index[dataName].resize(index.size());
-        for(size_t i = 0; i < index.size(); ++i){
-            this->name2index[dataName][i].reset(deSeriEncSegmentNode(index[i]));
+        stringstream ss(index.second);
+        for(size_t i = index.first.first; i < index.first.second; ++i)
+        {
+            string buf;
+            ss >> buf;
+            this->name2index[dataName][i].reset(deSeriEncSegmentNode(buf));
         }
-        if(config::DEBUG){
-            for(size_t i = 0; i < index.size(); ++i){
+        if(0)
+        {
+            for(size_t i = index.first.first; i < index.first.second; ++i)
+            {
                 printEncSegmentNode(crypto, this->name2index[dataName][i]);
             }
         }
@@ -281,22 +375,21 @@ public:
         return res;
 	}
 
-    vector<vector<uint32_t>> rangeQuery(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
-        olog.infoLog("recv request from" + conn.lock()->remote_address());
+    vector<size_t> rangeQuery(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        info("recv request from %s", conn.lock()->remote_address().c_str());
         if(!name2index.count(dataName)){
             return {};
         }
-        //std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())));
-        //std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())));
+        // std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
+        // std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
+        // pair<Ciphertext, Ciphertext> encPosInfo{fut1.get(), fut2.get()};
 
-        //pair<Ciphertext, Ciphertext> posInfo{fut1.get(), fut2.get()}; 
         pair<Ciphertext, Ciphertext> encPosInfo{CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0), CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1)};
         Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
         Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
 
-        char buf[50];
-        std::sprintf(buf, "predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
-        olog.debugLog(string(buf));
+        
+        debug("predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
 
         {
             startPos /= Integer(10).pow(config::FLOAT_EXP);
@@ -308,10 +401,80 @@ public:
             endPos += Integer(config::EPSILON);
             if(endPos >= Integer(name2data[dataName].size())) endPos = Integer(name2data[dataName].size()) - 1;
         }
-        pair<uint32_t, uint32_t> posInfo{startPos.to_uint(), endPos.to_uint()};
+        pair<size_t, size_t> posInfo{startPos.to_ulong(), endPos.to_ulong()};
 
-        vector<vector<uint32_t>> ret{{posInfo.first, posInfo.second}};
-        // search range [startPos, endPos]
+        // no data
+        if(posInfo.first > posInfo.second)
+        {
+            return {};
+        }
+
+
+        debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+
+        Vec<PackedCiphertext> packedCmpResult = packSearching(dataName, posInfo, limits);
+        vector<size_t> ret{};
+        {
+            Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+
+            debug("decrypt packed cmpResult size is %lld", cmpResult.length());
+            // if(config::LOG){
+            //     string idxStr, cmpResultStr;
+            //     for(size_t i = 0; i < cmpResult.length(); ++i){
+            //         idxStr += std::to_string(i) + " ";
+            //         cmpResultStr += cmpResult[i].get_str() + " ";
+            //     }
+            //     debug(idxStr.c_str());
+            //     debug(cmpResultStr.c_str());
+            // }
+            for(size_t posIdx = posInfo.first; posIdx <= posInfo.second; ++posIdx){
+                if(cmpResult[posIdx - posInfo.first] == 2 * name2data[dataName].begin()->size()){
+                    ret.push_back(posIdx);
+                }
+            }
+        }
+
+        return ret;
+    }
+
+    Vec<PackedCiphertext>  packSearching(const string& dataName, const pair<size_t, size_t>& posInfo, const vector<string>& limits)
+    {
+        debug("packing SVC start");
+        size_t dim = name2data[dataName].front().size();
+        size_t n = posInfo.second - posInfo.first + 1;
+        EQueryRectangle eQR(limits);
+        // 将数据以列重新排列
+        vector<Vec<Ciphertext>> encData(dim, Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n));
+        vector<Vec<Ciphertext>> lowLimits(dim);
+        vector<Vec<Ciphertext>> highLimits(dim);
+
+        list<vector<Ciphertext>>::iterator iter = id2data[dataName][id2data[dataName].begin()->first + posInfo.first];
+        for(size_t i = posInfo.first; i <= posInfo.second; ++i, ++iter){
+            for(size_t j = 0; j < dim; ++j){
+                encData[j][i - posInfo.first] = (*iter)[j];
+            }
+        }
+
+        for(size_t i = 0; i < dim; ++i){
+            lowLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, eQR.get_minvec()[i]));
+            highLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, eQR.get_maxvec()[i]));
+        }
+
+        size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
+        size_t numPackedCiphertext = size_t(std::ceil(double(n) / double(numIntegerPerCiphertext)));
+        Vec<PackedCiphertext> ret(NTL::INIT_SIZE_TYPE{}, numPackedCiphertext, PackedCiphertext(crypto->encrypt(0), numIntegerPerCiphertext, 32));
+
+        for(size_t i = 0; i < dim; ++i){
+            vector<PackedCiphertext> lowCmpRes = SVC(lowLimits[i], encData[i]);
+            vector<PackedCiphertext> highCmpRes = SVC(encData[i], highLimits[i]);
+
+            for(size_t j = 0; j < numPackedCiphertext; ++j){
+                ret[j].data.data *= lowCmpRes[j].data.data;
+                ret[j].data.data *= highCmpRes[j].data.data;
+            }
+        }
+
+        debug("packing SVC finish");
         return ret;
     }
 
@@ -375,6 +538,69 @@ public:
         return ret;
     }
 
+    // packed SIC
+    vector<PackedCiphertext> SVC(const Vec<Ciphertext>& a, const Vec<Ciphertext>& b){
+        debug("dsp SVC start");
+        assert(a.length() == b.length());
+        size_t n = a.length();
+        size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
+        size_t numPackedCiphertext = size_t(std::ceil(double(n) / double(numIntegerPerCiphertext)));
+        
+        Integer coin = Random::instance().rand_int(crypto->get_pub().n) % Integer(2);
+        Vec<Ciphertext> Z(NTL::INIT_SIZE_TYPE{}, n);
+
+        if(coin == 1){
+            for(size_t i = 0; i < n; ++i){
+                Z[i] = SMinus(_times(a[i], 2), _times(b[i], 2).data * crypto->encrypt(1).data).data * crypto->encrypt(Integer(2).pow(32 - 1)).data;
+            }
+        }else{
+            for(size_t i = 0; i < n; ++i){
+                Z[i] = SMinus(_times(b[i], 2).data * crypto->encrypt(1).data, _times(a[i], 2)).data * crypto->encrypt(Integer(2).pow(32 - 1)).data;
+            }
+        }
+
+        Integer r = Random::instance().rand_int_bits((getMaxBitLength(crypto->get_pub().n) / 4).to_ulong() - 2);
+
+        r = 1;
+        for(auto& z : Z){
+            z = _times(z, r);
+        }
+
+        vector<PackedCiphertext> C(numPackedCiphertext, PackedCiphertext(crypto->encrypt(0), numIntegerPerCiphertext, 32));
+
+        size_t idx = 0;
+        for(size_t i = 0; i < numPackedCiphertext; ++i){
+            size_t s = idx;
+            size_t e = std::min(idx + numIntegerPerCiphertext, n);
+            Vec<Ciphertext> packedC(NTL::INIT_SIZE_TYPE{}, numIntegerPerCiphertext, crypto->encrypt(0));
+            for(size_t j = s; j < e; ++j, ++idx){
+                packedC[j - s].data = Z[idx].data;
+            }
+            C[i] = Vector::pack_ciphertexts(packedC, 32, *crypto);
+        }
+
+        vector<string> seriC(C.size());
+        for(size_t i = 0; i < C.size(); ++i){
+            seriC[i] = C[i].data.data.get_str();
+        }
+        vector<string> packedCmpResult = dap_.call<vector<string>>("SVC", seriC);
+
+        debug("call dap SVC finish");
+
+        vector<PackedCiphertext> ret(numPackedCiphertext);
+        for(size_t i = 0; i < numPackedCiphertext; ++i){
+            if(coin == 1){
+                ret[i] = PackedCiphertext(crypto->encrypt(0), numIntegerPerCiphertext, 32);
+                ret[i].data.data = Integer(packedCmpResult[i].c_str());
+            }else{
+                ret[i] = Vector::encrypt_pack(Vec<Integer>(NTL::INIT_SIZE_TYPE{}, numIntegerPerCiphertext, 1), 32, *crypto);
+                ret[i].data.data = SMinus(ret[i].data.data, Integer(packedCmpResult[i].c_str())).data;
+            }
+        }
+        debug("dsp SVC finish");
+        return ret;
+    }
+
     Ciphertext SO(const Ciphertext& a_low,const Ciphertext& a_high,const Ciphertext& b_low,const Ciphertext& b_high){
         return SM(SIC(b_low, a_high), SIC(a_low, b_high));
     }
@@ -398,9 +624,8 @@ public:
 
 
     Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input, bool whichPred = 0){
-        char buf[30];
-        std::sprintf(buf, "input = %s", crypto->decrypt(input).get_str().c_str());
-        olog.debugLog(string(buf));
+        debug("dsp CAP start");
+        debug("input = %s", crypto->decrypt(input).get_str().c_str());
 
         Ciphertext P = crypto->encrypt(0);
         Ciphertext F = crypto->encrypt(0);
@@ -412,8 +637,7 @@ public:
             F.data *= f.data; 
             P.data *= SM(f, acc).data;
 
-            std::sprintf(buf, "cur = %lu, F = %s, P = %s", cur, crypto->decrypt(f).get_str().c_str(), (crypto->decrypt(P) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
-            olog.debugLog(string(buf));
+            debug("cur = %lu, F = %s, P = %s", cur, crypto->decrypt(f).get_str().c_str(), (crypto->decrypt(P) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
 
             if(SPFT(index, cur, F, input) == LEFT){
                 cur = 2 * cur + 1;
@@ -421,6 +645,7 @@ public:
                 cur = 2 * cur + 2;
             }
         }
+        debug("dsp CAP end");
         return P;
     }
 
@@ -435,21 +660,24 @@ public:
     // data id to iterator of data
     map<string, map<size_t, list<vector<Ciphertext>>::iterator>> id2data;
 
+    // mutex
+    mutex m_n2d;
+    mutex m_n2i;
+    mutex m_i2d;
 
-    // 日志系统
-    Log olog;
 };
 
 class DAP : public rpc_server{
 public:
 
-    DAP() : rpc_server(config::DAP_PORT, std::thread::hardware_concurrency()), dsp_(config::DSP_IP, config::DSP_PORT), olog("DAP"){
+    DAP() : rpc_server(config::DAP_PORT, std::thread::hardware_concurrency()), dsp_(config::DSP_IP, config::DSP_PORT){
         recvKeys();
 
         // regist
         this->register_handler("SM", &DAP::SM, this);
         this->register_handler("SIC", &DAP::SIC, this);
         this->register_handler("DEC", &DAP::DEC, this);
+        this->register_handler("SVC", &DAP::SVC, this);
     }
 
 
@@ -473,6 +701,76 @@ public:
         return crypto->decrypt(Integer(c.c_str())).get_str();
     }
 
+    // packed SIC
+    // vector<string> SVC(rpc_conn conn, const vector<string>& C){
+    //     vector<Integer> M(C.size());
+    //     for(size_t i = 0; i < C.size(); ++i){
+    //         M[i] = crypto->decrypt(Ciphertext(Integer(C[i].c_str())));            
+    //         if(M[i] < 0){
+    //             M[i] = -M[i];
+    //         }
+    //     }
+
+    //     size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
+        
+    //     vector<string> ret(M.size());
+
+    //     mpz_class mp_;
+    //     mp_.set_str("ffffffff", 16);
+    //     Integer mask(mp_);
+    //     for(size_t i = 0; i < M.size(); ++i){
+    //         Integer packedCmpResult = 0;
+    //         for(size_t j = 0; j < numIntegerPerCiphertext; ++j){
+    //             Integer m((M[i] >> (j * 32)) & mask);
+    //             m -= Integer(2).pow(32 - 1);
+    //             m %= crypto->get_pub().n;
+    //             Integer u = 0;
+    //             if(getMaxBitLength(m) > getMaxBitLength(crypto->get_pub().n) / 2){
+    //                 u = 1;
+    //             }
+    //             packedCmpResult |= (u << j*32);
+    //         }
+    //         ret[i] = crypto->encrypt(packedCmpResult).data.get_str();
+    //     }
+    //     return ret;
+    // }
+    vector<string> SVC(rpc_conn conn, const vector<string>& C){
+        vector<Vec<Integer>> M(C.size());
+        vector<string> ret(M.size());
+        size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
+        for(size_t i = 0; i < C.size(); ++i){
+            PackedCiphertext packed(Integer(C[i].c_str()), numIntegerPerCiphertext, 32);
+            M[i] = Vector::decrypt_pack(packed, *(this->crypto));
+
+            if(config::LOG){
+                string content;
+                for(size_t j = 0; j < M[i].length(); ++j){
+                    content += (M[i][j] - Integer(2).pow(32 - 1)).get_str() + " ";
+                }
+                debug(content.c_str());
+            }
+
+            Vec<Integer> packedCmpResult(NTL::INIT_SIZE_TYPE{}, M[i].length(), 0);
+            for(size_t j = 0; j < numIntegerPerCiphertext; ++j){
+                M[i][j] -= Integer(2).pow(32 - 1);
+                if(getMaxBitLength(M[i][j] % crypto->get_pub().n) > getMaxBitLength(crypto->get_pub().n) / 2){
+                    packedCmpResult[j] = 1;
+                }
+            }
+            
+
+            if(config::LOG){
+                string content;
+                for(size_t j = 0; j < packedCmpResult.length(); ++j){
+                    content += packedCmpResult[j].get_str() + " ";
+                }
+                debug(content.c_str());
+            }
+            ret[i] = PackedCiphertext(Vector::encrypt_pack(packedCmpResult, 32, *crypto)).data.data.get_str();
+        }
+        return ret;
+    }
+
 public:
     PaillierFast* crypto;
     rpc_client dsp_;
@@ -485,10 +783,8 @@ public:
         PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
-        olog.infoLog("recv keys");
+        info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
     }
-    // 日志系统
-    Log olog;
 };
 
 class AU {
@@ -547,11 +843,12 @@ public:
         }
         pair<string, string> encRange{crypto->encrypt(range.first).data.get_str(), crypto->encrypt(range.second).data.get_str()};
         string dataName = "test";
-        //vector<vector<uint32_t>> res = dsp_.call<vector<vector<uint32_t>>>("rangeQuery", dataName, encRange, limits);
-        auto fut = dsp_.async_call<FUTURE>("rangeQuery", dataName, encRange, limits);
-        vector<vector<uint32_t>> res = fut.get().as<vector<vector<uint32_t>>>();
+        // auto fut = dsp_.async_call<FUTURE>("rangeQuery", dataName, encRange, limits);
+        // vector<size_t> res = fut.get().as<vector<size_t>>();
+        vector<size_t> res = dsp_.call<vector<size_t>>("rangeQuery", dataName, encRange, limits);
+
         if(!res.empty()){
-            std::cout << res[0][0] << ", " << res[0][1] << std::endl;
+            std::cout << res.size() << std::endl;
         }else{
             std::cout << "empty" << std::endl;
         }
@@ -562,7 +859,7 @@ private:
 
 class CA : public rpc_server{
 public:
-    CA(const uint32_t key_size = config::KEY_SIZE) : rpc_server(config::CA_PORT, 1), crypto(new PaillierFast(key_size)), olog("CA"){
+    CA(const uint32_t key_size = config::KEY_SIZE) : rpc_server(config::CA_PORT, 1), crypto(new PaillierFast(key_size)){
         crypto->generate_keys();
         this->register_handler("getPub", &CA::getPub, this);
         this->register_handler("getPriv", &CA::getPriv, this);
@@ -576,8 +873,6 @@ public:
 
 private:
     PaillierFast* crypto;
-    // 日志系统
-    Log olog;
 };
 
 ENTITY_NAMESPACE_END
