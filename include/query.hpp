@@ -20,6 +20,47 @@ inline Integer getMaxBitLength(const Integer& a){
 }
 
 // 查询矩形,矩形格式为[xmin,ymin,zmin,xmax,ymax,zmax]
+template<class KT=uint32_t>
+class QueryRectangle{
+public:
+	QueryRectangle(const vector<KT>& vals):dim(vals.size()/2),minvec(vector<KT>(dim)),maxvec(vector<KT>(dim)){
+		for(auto i=0;i<dim;++i){
+			minvec[i]=vals[i];
+			maxvec[i]=vals[i+dim];
+		}
+	}
+	const vector<KT>& get_minvec()const{
+		return minvec;
+	}
+	const vector<KT>& get_maxvec()const{
+		return maxvec;
+	}
+	bool isFallin(const vector<KT>& p)const{
+		for(auto i=0;i<dim;++i){
+			if(p[i]<minvec[i]||p[i]>maxvec[i]){
+				return false;
+			}
+		}
+		return true;
+	}
+	template<uint32_t dim>
+	bool isFallin(const std::array<KT, dim>& p)const{
+		for(auto i=0;i<dim;++i){
+			if(p[i]<minvec[i]||p[i]>maxvec[i]){
+				return false;
+			}
+		}
+		return true;
+	}
+public:
+	int dim;
+private:
+	vector<KT> minvec;
+	vector<KT> maxvec;
+};
+
+
+// 查询矩形,矩形格式为[xmin,ymin,zmin,xmax,ymax,zmax]
 class EQueryRectangle{
 public:
 	EQueryRectangle(const vector<Ciphertext>& vals) : dim(vals.size() / 2), minvec(vector<Ciphertext>(dim)), maxvec(vector<Ciphertext>(dim)){
