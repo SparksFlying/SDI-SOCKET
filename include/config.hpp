@@ -6,7 +6,9 @@ using std::map;
 using std::string;
 
 namespace config{
-    const string workspaceFolder = "/home/zanglang/source/SDI/";
+    const string workspaceFolder = "/home/zanglang/source/SDI";
+    const string logFolder = workspaceFolder + "/log";
+    const string dataFolder = workspaceFolder + "/data";
     constexpr uint32_t KEY_SIZE = 1024;
     constexpr size_t EPSILON = 64;
     constexpr uint64_t SIZE = 1000;
@@ -21,7 +23,9 @@ namespace config{
     };
 
     constexpr size_t FLOAT_EXP = 30;
+    constexpr size_t NUM_THREADS = 4;
     constexpr bool LOG = true;
+    constexpr bool PARAL = true;
 
     const string DO_IP = "127.0.0.1";
     const string DSP_IP = "127.0.0.1";

@@ -171,7 +171,7 @@ Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
  
 	typedef sinks::synchronous_sink< sinks::text_file_backend > text_sink;
 	boost::shared_ptr< sinks::text_file_backend > backend = boost::make_shared< sinks::text_file_backend >(
-			keywords::file_name = config::workspaceFolder +  sLogFilePfx + "_%N.log", 
+			keywords::file_name = config::logFolder + "/"+  sLogFilePfx + "_%N.log", 
 			keywords::rotation_size = nRotSizeInByte,
 			keywords::open_mode = std::ios_base::app
 		);

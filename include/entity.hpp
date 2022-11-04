@@ -19,7 +19,7 @@
 #include "ophelib/util.h"
 #include "ophelib/ml.h"
 #include "ophelib/random.h"
-#include "protocol.hpp"
+#include "query.hpp"
 #include <cmath>
 #include <sstream>
 #include <mutex>
@@ -52,8 +52,9 @@ using namespace ophelib;
 
 enum STATUS{
     SUCCESS = 200,
-    NOSUCHDATA = 201,
-    NOTCOMPLATE = 202
+    NOSUCHDATA,
+    NOTCOMPLATE,
+    DUPLICATE
 };
 
 template<uint32_t dim = 2>
@@ -75,20 +76,23 @@ public:
 template<uint32_t dim = 2>
 class DO : public rpc_server{
 public:
+    using node_t=interval_tree_t<uint64_t>::node_type;
     string dataName;
     vector<record<dim>> data_;
     size_t epsilon_ = config::EPSILON;
     PaillierFast* crypto;
     std::map<size_t, uint64_t> mortonTable_;
-    vector<interval_tree_t<uint64_t> ::node_type*> plainIndex;
+    vector<node_t*> plainIndex;
+
+    // place inserted new items
+    vector<pair<uint64_t, record<dim>>> buffer;
     // 对端通信实体
     rpc_client dap_;
     rpc_client dsp_;
 
-    using node_t=interval_tree_t<uint64_t>::node_type;
     //std::set<std::shared_ptr<AU>> users_;
 
-    DO(const string& dataName, const vector<record<dim>>& data, int port = 10001, int thread_num = std::thread::hardware_concurrency()): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName){
+    DO(const string& dataName, const vector<record<dim>>& data, int port = 10001, int thread_num = config::NUM_THREADS): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName){
         
         // sort data according its morton code
         for(record<dim> item : data) {
@@ -158,13 +162,19 @@ public:
         vector<pair<pair<size_t, size_t>, string>> encDataBlocks;
         vector<pair<pair<size_t, size_t>, string>> indexBlocks;
         {
-            // std::future<vector<string>> res1 = std::async(&DO::buildIndex, this);
-            // std::future<vector<pair<size_t, vector<string>>>> res2 = std::async(&DO::encryptData, this);
             
-            // auto index = res1.get();
-            // auto encData = res2.get();
-            auto index = buildIndex();
-            auto encData = encryptData();
+            vector<string> index;
+            vector<pair<size_t, vector<string>>> encData;
+            if(config::PARAL){
+                std::future<vector<string>> res1 = std::async(&DO::buildIndex, this);
+                std::future<vector<pair<size_t, vector<string>>>> res2 = std::async(&DO::encryptData, this);
+                index = res1.get();
+                encData = res2.get();
+            }
+            else{
+                index = buildIndex();
+                encData = encryptData();
+            }
 
             encDataBlocks = seriEncData(encData);
             debug("encData seri %lu blocks", encDataBlocks.size());
@@ -343,15 +353,104 @@ public:
         crypto = new PaillierFast(pk, sk);
         info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
     }
+
+    // template<class iterator>
+    // iterator upperBound(iterator first, iterator last, uint64_t val){
+    //     size_t len = std::distance(first, last);
+
+    //     while (len > 0)
+    //     {
+    //         size_t half = len >> 1;
+    //         iterator middle = first;
+    //         std::advance(middle, half);
+    //         if (val < mortonTable_[(*middle).id])
+    //             len = half;
+    //         else
+    //         {
+    //             first = middle;
+    //             ++first;
+    //             len = len - half - 1;
+    //         }
+    //     }
+    //     return first;
+    // }
+
+    size_t caculateNewId(uint64_t val){
+        size_t idx = 0;
+
+        for(size_t i = 0; i < buffer.size(); ++i){
+            if(buffer[i].first < val) idx++;
+            else if(buffer[i].first == val){
+                return -1;
+            }
+        }
+
+        auto iter = std::lower_bound(data_.begin(), data_.end(), val, [this](decltype(data_.begin()) iter, const uint64_t& val){
+            if(val < this->mortonTable_[(*iter).id]){
+                return true;
+            }
+            return false;
+        });
+        if(this->mortonTable_[(*iter).id] == val){
+            return -1;
+        }
+        return idx + std::distance(data_.begin(), iter) + 1;
+    }
+
+    // find seg node idx which covers key
+    size_t search(uint64_t val){
+        size_t cur = 0;
+        while(cur < plainIndex.size()){
+            if(val >= plainIndex[cur]->low() && val <= plainIndex[cur]->high()){
+                break;
+            }
+
+            if(val <= plainIndex[cur]->left()->max()){
+                cur = 2 * cur + 1;
+            }else{
+                cur = 2 * cur + 2;
+            }
+        }
+        return cur;
+    }
+    // insert k-v record
+    STATUS insert(const pair<array<uint32_t, dim>, void*> item){
+        uint64_t val = morton_code<dim, int(64/dim)>::encode(item.first);
+        // check duplicate
+        size_t dataIdx = caculateNewId(val);
+        if(dataIdx == size_t(-1)){
+            return DUPLICATE;
+        }
+
+        // insert item into buffer
+        buffer.emplace({morton_code<dim, int(64/dim)>::encode(item.first), record<dim>{dataIdx, item.first, item.second}});
+
+        // search affected segments
+        size_t nodeIdx = search(val);
+
+        if(!dsp_.has_connected()){
+            while(!dsp_.connect());
+        }
+
+
+        int status = dsp_.call<int>("insert", item.first, dataIdx, nodeIdx);
+        return STATUS(status);
+    }
+
+    void del(){
+
+    }
 };
 
 class DSP : public rpc_server{
 public:
-    DSP() : rpc_server(config::DSP_PORT, std::thread::hardware_concurrency()), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT){
+    DSP() : rpc_server(config::DSP_PORT, config::NUM_THREADS), crypto(nullptr), dap_(config::DAP_IP, config::DAP_PORT){
         recvKeys();
         while(!dap_.connect()){
             //std::this_thread::sleep_for(std::chrono::duration<int>(1));
         }
+
+        load("test");
 
         this->register_handler("recvData", &DSP::recvData, this);
         this->register_handler("recvIndex", &DSP::recvIndex, this);
@@ -359,6 +458,7 @@ public:
         this->register_handler("rangeQueryOpt", &DSP::rangeQueryOpt, this);
         this->register_handler("recvDataInfo", &DSP::recvDataInfo, this);
         this->register_handler("recvIndexInfo", &DSP::recvIndexInfo, this);
+
     }
 
     void recvKeys(){
@@ -396,7 +496,8 @@ public:
         string remoteIP = conn.lock()->remote_address();
         debug("from %s recv dataset %s , block from %lu to %lu", remoteIP.c_str(), dataName.c_str(), encData.first.first, encData.first.second);
         stringstream ss(encData.second);
-        auto iter = std::prev(this->name2data[dataName].begin(), encData.first.first);
+        auto iter = this->name2data[dataName].begin();
+        std::advance(iter, encData.first.first);
         for(size_t i = encData.first.first; i < encData.first.second; ++i, ++iter)
         {
             size_t id;
@@ -409,7 +510,12 @@ public:
             }
         }
         this->name2count[dataName] += encData.first.second - encData.first.first;
+        if(name2count[dataName] == name2data[dataName].size() + name2index[dataName].size()){
+            // check dat and index file exists
+            save(dataName);
+        }
     }
+
 
     void recvIndex(rpc_conn conn, const string& dataName, pair<pair<size_t, size_t>, string>&& index){
         string remoteIP = conn.lock()->remote_address();
@@ -430,6 +536,112 @@ public:
             }
         }
         this->name2count[dataName] += index.first.second - index.first.first;
+
+        if(name2count[dataName] == name2data[dataName].size() + name2index[dataName].size()){
+            // check dat and index file exists
+            save(dataName);
+        }
+    }
+
+    void save(const string& dataName){
+        if(!checkFileExist(config::dataFolder + "/" + dataName + ".dat")){
+            // std::thread t1(&DSP::saveData, this, dataName, config::dataFolder + "/" + dataName + ".dat");
+            // std::thread t2(&DSP::saveIndex, this, dataName, config::dataFolder + "/" + dataName + ".idx");
+            // t1.detach();
+            // t2.detach();
+            saveData(dataName, config::dataFolder + "/" + dataName + ".dat");
+        }
+        if(!checkFileExist(config::dataFolder + "/" + dataName + ".idx")){
+            saveIndex(dataName, config::dataFolder + "/" + dataName + ".idx");
+        }
+    }
+
+    void load(const string& dataName){
+        if(checkFileExist(config::dataFolder + "/" + dataName + ".dat")){
+            std::thread t(&DSP::loadData, this, dataName, config::dataFolder + "/" + dataName + ".dat");
+            if(t.joinable()) t.join();
+            //loadData(dataName, config::dataFolder + "/" + dataName + ".dat");
+        }
+        if(checkFileExist(config::dataFolder + "/" + dataName + ".idx")){
+            std::thread t(&DSP::loadIndex, this, dataName, config::dataFolder + "/" + dataName + ".idx");
+            if(t.joinable()) t.join();
+            //loadIndex(dataName, config::dataFolder + "/" + dataName + ".idx");
+        }
+    }
+
+    void saveData(const string& dataName, const string& filePath){
+        std::ofstream out(filePath, std::ios::out | std::ios::binary);
+        if(!out.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        lock_guard<mutex> g(m_n2d);
+        out << name2data[dataName].size() << ' ' << name2data[dataName].begin()->size() << ' ';
+        std::for_each(name2data[dataName].begin(), name2data[dataName].end(), [&out](const vector<Ciphertext>& item){
+            for(size_t i = 0; i < item.size(); ++i){
+                out << item[i].data.get_str() << ' ';
+            }
+        });
+        out.close();
+    }
+
+    void saveIndex(const string& dataName, const string& filePath){
+        std::ofstream out(filePath, std::ios::out | std::ios::binary);
+        if(!out.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        lock_guard<mutex> g(m_n2i);
+        out << name2index[dataName].size() << ' ';
+        std::for_each(name2index[dataName].begin(), name2index[dataName].end(), [&out](const shared_ptr<encSegmentNode>& node){
+            out << seriEncSegmentNode(*node) << ' ';
+        });
+        out.close();
+    }
+
+    void loadData(const string& dataName, const string& filePath){
+        std::ifstream in(filePath, std::ios::in | std::ios::binary);
+        if(!in.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        std::lock(m_n2d, m_i2d);
+        size_t size;
+        uint32_t dim;
+        in >> size >> dim;
+        name2data[dataName].resize(size);
+        auto iter = name2data[dataName].begin();
+        string str;
+        for(size_t i = 0; i < size; ++i, ++iter){
+            id2data[dataName][i] = iter;
+            (*iter).resize(dim);
+            for(size_t j = 0; j < dim; ++j){
+                in >> str;
+                (*iter)[j].data = Integer(str.c_str());
+            }
+        }
+        name2count[dataName] += size;
+        in.close();
+    }
+
+    void loadIndex(const string& dataName, const string& filePath){
+        std::ifstream in(filePath, std::ios::in | std::ios::binary);
+        if(!in.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        lock_guard<mutex> g(m_n2i);
+        size_t size;
+        in >> size;
+        name2index[dataName].resize(size);
+        std::for_each(name2index[dataName].begin(), name2index[dataName].end(), [&in](shared_ptr<encSegmentNode>& item){
+            string str;
+            in >> str;
+            item.reset(deSeriEncSegmentNode(str));
+        });
+
+        name2count[dataName] += size;
+        in.close();
     }
 
     Ciphertext checkData(const string& dataName, const EQueryRectangle& QR, const size_t& id){
@@ -450,11 +662,11 @@ public:
         if(name2count[dataName] != name2data[dataName].size() + name2index[dataName].size()){
             return {NOTCOMPLATE, {}};
         }
-        // std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
-        // std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
-        // pair<Ciphertext, Ciphertext> encPosInfo{fut1.get(), fut2.get()};
+        std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
+        std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
+        pair<Ciphertext, Ciphertext> encPosInfo{fut1.get(), fut2.get()};
 
-        pair<Ciphertext, Ciphertext> encPosInfo{CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0), CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1)};
+        //pair<Ciphertext, Ciphertext> encPosInfo{CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0), CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1)};
         Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
         Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
 
@@ -508,7 +720,7 @@ public:
         return ret;
     }
 
-    Vec<PackedCiphertext>  packSearching(const string& dataName, const pair<size_t, size_t>& posInfo, const vector<string>& limits)
+    Vec<PackedCiphertext> packSearching(const string& dataName, const pair<size_t, size_t>& posInfo, const vector<string>& limits)
     {
         debug("packing SVC start");
         size_t dim = name2data[dataName].front().size();
@@ -556,6 +768,16 @@ public:
 
     vector<vector<uint32_t>> rangeQueryOpt(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
         return {};
+    }
+
+    int insert(rpc_conn conn, const string& dataName, pair<size_t, vector<string>>&& item, const size_t& segIdx){
+        lock_guard<mutex> g(m_n2d);
+        vector<Ciphertext> tmp(item.second.size());
+        for(size_t i = 0; i < tmp.size(); ++i) tmp[i] = Integer(item.second[i].c_str());
+        name2data[dataName].insert(id2data[dataName][id2data[dataName].begin()->first + item.first], std::move(tmp));
+
+        name2count[dataName]++;
+        return SUCCESS;
     }
 
     // secure multiply protocol
@@ -755,7 +977,7 @@ public:
 class DAP : public rpc_server{
 public:
 
-    DAP() : rpc_server(config::DAP_PORT, std::thread::hardware_concurrency()), dsp_(config::DSP_IP, config::DSP_PORT){
+    DAP() : rpc_server(config::DAP_PORT, config::NUM_THREADS), dsp_(config::DSP_IP, config::DSP_PORT){
         recvKeys();
 
         // regist
@@ -768,7 +990,7 @@ public:
 
     string SM(rpc_conn conn, const string& a, const string& b){
         debug("call SM from %s", conn.lock()->remote_address().c_str());
-        printf("call SM from %s", conn.lock()->remote_address().c_str());
+        //printf("call SM from %s", conn.lock()->remote_address().c_str());
         Integer ha = crypto->decrypt(Integer(a.c_str()) % *crypto->get_n2());
         Integer hb = crypto->decrypt(Integer(b.c_str()) % *crypto->get_n2());
         Integer h = (ha * hb) % crypto->get_pub().n;
@@ -777,7 +999,7 @@ public:
 
     string SIC(rpc_conn conn, const string& c){
         debug("call SIC from %s", conn.lock()->remote_address().c_str());
-        printf("call SIC from %s", conn.lock()->remote_address().c_str());
+        //printf("call SIC from %s", conn.lock()->remote_address().c_str());
         Integer m = crypto->decrypt(Ciphertext(Integer(c.c_str()))) % crypto->get_pub().n;
         Integer u = 0;
         if(getMaxBitLength(m >= 0 ? m : -m) > getMaxBitLength(crypto->get_pub().n) / 2){
@@ -788,7 +1010,7 @@ public:
 
     string DEC(rpc_conn conn, const string& c){
         debug("call DEC from %s", conn.lock()->remote_address().c_str());
-        printf("call DEC from %s", conn.lock()->remote_address().c_str());
+        //printf("call DEC from %s", conn.lock()->remote_address().c_str());
         return crypto->decrypt(Integer(c.c_str())).get_str();
     }
 
@@ -827,7 +1049,7 @@ public:
     // }
     vector<string> SVC(rpc_conn conn, const vector<string>& C){
         debug("call SVC from %s", conn.lock()->remote_address().c_str());
-        printf("call SVC from %s", conn.lock()->remote_address().c_str());
+        //printf("call SVC from %s", conn.lock()->remote_address().c_str());
         vector<Vec<Integer>> M(C.size());
         vector<string> ret(M.size());
         size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
