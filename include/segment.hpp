@@ -21,8 +21,10 @@ using namespace lib_interval_tree;
 
 template<class FT = double, size_t factor = 30>
 std::string float2string(FT number){
-    char buf[factor + 1];
-    sprintf(buf, string("%." + std::to_string(factor) + "f").c_str(), number);
+    char buf[20 + factor + 1];
+    int len;
+    len = sprintf(buf, string("%." + std::to_string(factor) + "f").c_str(), number);
+    buf[len] = '\0';
     std::string s(buf);
     size_t dotpos = s.find('.');
     if(dotpos != std::string::npos){
@@ -106,8 +108,8 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
                     segs[i].end
                 }, 
                 std::make_shared<pair<linearModel, linearModel>>(
-                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start)))},
-                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start)))}
+                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(uint64_t(segs[i].slope * double(segs[i].start)))},
+                    linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(uint64_t(segs[i].slope * double(segs[i].start)))}
                 )
             );
 			
@@ -119,8 +121,8 @@ std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, l
                             segs[i + 1].start - 1
                         }, 
                         std::make_shared<pair<linearModel, linearModel>>(
-                            linearModel{segs[i + 1].slope, Integer(segs[i + 1].pos) - Integer(int64_t(segs[i + 1].slope * double(segs[i + 1].start))) + Integer(int64_t(segs[i + 1].slope * double((segs[i + 1].start - (segs[i].end + 1)))))},
-                            linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(int64_t(segs[i].slope * double(segs[i].start))) + Integer(int64_t(segs[i].slope * double(int64_t(segs[i].end) - int64_t(segs[i + 1].start - 1))))}
+                            linearModel{segs[i + 1].slope, Integer(segs[i + 1].pos) - Integer(uint64_t(segs[i + 1].slope * double(segs[i + 1].start))) + Integer(uint64_t(segs[i + 1].slope * double((segs[i + 1].start - (segs[i].end + 1)))))},
+                            linearModel{segs[i].slope, Integer(segs[i].pos) - Integer(uint64_t(segs[i].slope * double(segs[i].start))) - Integer(uint64_t(segs[i].slope * double(uint64_t(segs[i + 1].start - 1) - uint64_t(segs[i].end))))}
                         )
                     );
 				}
@@ -228,11 +230,6 @@ void printEncSegmentNode(PaillierFast* const crypto, const std::shared_ptr<encSe
     printf("pred1 = [%lu, %lu]\n", pred1.first, pred1.second);
     printf("pred2 = [%lu, %lu]\n", pred2.first, pred2.second);
 }
-
-struct TreeNode{
-    size_t nodeIdx;
-    
-};
 
 
 // pgm segment algorithm
@@ -641,16 +638,18 @@ vector<Segment<int64_t, double>> fit(vector<KT>& keys, PT epsilon = 32)
 
 vector<segment<uint64_t, size_t, double>> transform(const vector<int64_t>& keys, vector<Segment<int64_t, double>>&& pgmSegments)
 {
-    // {
-    //     vector<pair<size_t, size_t>> preds(keys.size());
-    //     for(size_t i = 0; i < preds.size(); ++i){
-    //         auto it = std::prev(std::upper_bound(pgmSegments.begin(), pgmSegments.end(), keys[i]));
-    //         auto pos = std::min<size_t>((*it)(keys[i]), std::next(it)->intercept);
-    //         preds[i].first = PGM_SUB_EPS(pos, 32);
-    //         preds[i].second = PGM_ADD_EPS(pos, 32, keys.size());
-    //     }
-    //     std::cout << "end";
-    // }
+    {
+        vector<pair<size_t, size_t>> preds(keys.size());
+        for(size_t i = 0; i < preds.size(); ++i){
+            auto it = std::prev(std::upper_bound(pgmSegments.begin(), pgmSegments.end(), keys[i]));
+            auto pos = std::min<size_t>((*it)(keys[i]), std::next(it)->intercept);
+            preds[i].first = PGM_SUB_EPS(pos, config::EPSILON);
+            preds[i].second = PGM_ADD_EPS(pos, config::EPSILON, keys.size());
+            if(i >= preds[i].first && i <= preds[i].second);
+            else printf("not in, pos=%lu, pred=[%lu, %lu]\n", i, preds[i].first, preds[i].second);
+        }
+        std::cout << "end";
+    }
     vector<segment<uint64_t, size_t, double>> segments(pgmSegments.size());
     for(size_t i = 0; i < segments.size(); ++i)
     {
