@@ -1,10 +1,12 @@
 #include "entity.hpp"
 #include <iostream>
 #include <array>
-using Entity::record;
 using std::array;
 using std::vector;
 using std::string;
+
+string dataName = "car-unique";
+size_t dataSize = 10000;
 
 vector<record<2>> getData(){
     size_t size = 100000;
@@ -12,7 +14,6 @@ vector<record<2>> getData(){
     for(size_t i = 0; i < size; ++i){
         data[i].id = i;
         data[i].key = array<uint32_t, 2>{uint32_t(i + 1), uint32_t(i + 2)};
-        data[i].value  = nullptr;
     }
 
     // QueryRectangle<uint32_t> QR(std::vector<uint32_t>{4500, 4500, 5000, 5000});
@@ -66,30 +67,67 @@ void test_seri()
     }
 }
 
+void initCA(int argc, char* argv[]){
+    Log::instance("CA").setLevel(logging::trivial::severity_level::debug);
+    Entity::CA ca(argc > 2 ? std::stoi(string(argv[2])) : config::KEY_SIZE);
+    ca.run();
+}
+
+void initDataOwner(int argc, char* argv[]){
+    Log::instance("DO").setLevel(logging::trivial::severity_level::debug);
+    Entity::DO<2> dataowner(dataName, read_from_roadnet_txt(dataSize, 2, config::dataFolder + "/" + "roadNet-CA-unique.txt"));
+    dataowner.outSource();
+    dataowner.run();
+}
+
+void initDSP(int argc, char* argv[]){
+    Log::instance("DSP").setLevel(logging::trivial::severity_level::debug);
+    Entity::DSP dsp;
+    dsp.run();
+}
+
+void initDAP(int argc, char* argv[]){
+    Log::instance("DAP").setLevel(logging::trivial::severity_level::debug);
+    Entity::DAP dap;
+    dap.run();
+}
+
+void initAU(int argc, char* argv[]){
+    Log::instance("AU").setLevel(logging::trivial::severity_level::debug);
+    Entity::AU au;
+
+    auto vals = read_vals_from_txt(config::queryFolder + "/" + "car_" + std::to_string(dataSize) +"_0.01.txt");
+
+    auto data = read_from_roadnet_txt(dataSize, 2, config::dataFolder + "/" + "roadNet-CA-unique.txt");
+    for(auto& val : vals){
+        QueryRectangle<uint32_t> QR(val);
+        au.query(dataName, QR);
+        vector<size_t> res;
+        for(size_t j = 0; j < data.size(); ++j){
+            if(QR.isFallin(data[j])){
+                res.push_back(j);
+            }
+        }
+        std::cout << "real size is " << res.size() << " ";
+        if(res.size() > 0){
+            std::cout << res.front() << ", " << res.back() << std::endl;
+        }
+    }
+}
+
 int run(int argc, char* argv[]){
     if(argc < 2) return 0;
     string entityType(argv[1]);
     if(entityType == "CA" || entityType == "ca"){
-        Log::instance("CA").setLevel(logging::trivial::severity_level::debug);
-        Entity::CA ca(argc > 2 ? std::stoi(string(argv[2])) : config::KEY_SIZE);
-        ca.run();
+        initCA(argc, argv);
     }else if(entityType == "DO" || entityType == "do"){
-        Log::instance("DO").setLevel(logging::trivial::severity_level::debug);
-        Entity::DO<2> dataowner("test", getData());
-        dataowner.outSource();
-        dataowner.run();
+        initDataOwner(argc, argv);
     }else if(entityType == "DSP" || entityType == "dsp"){
-        Log::instance("DSP").setLevel(logging::trivial::severity_level::debug);
-        Entity::DSP dsp;
-        dsp.run();
+        initDSP(argc, argv);
     }else if(entityType == "DAP" || entityType == "dap"){
-        Log::instance("DAP").setLevel(logging::trivial::severity_level::debug);
-        Entity::DAP dap;
-        dap.run();
+        initDAP(argc, argv);
     }else if(entityType == "AU" || entityType == "au"){
-        Log::instance("AU").setLevel(logging::trivial::severity_level::debug);
-        Entity::AU au;
-        au.query(QueryRectangle<uint32_t>(std::vector<uint32_t>{4500, 4500, 5000, 5000}));
+        initAU(argc, argv);
     }
     return 0;
 }
