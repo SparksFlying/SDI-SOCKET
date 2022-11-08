@@ -12,6 +12,7 @@
 #include <functional>
 #include <bitset>
 #include <sys/stat.h>
+#include <ophelib/integer.h>
 using namespace std::chrono;
 using std::vector;
 using std::string;
@@ -21,6 +22,10 @@ using std::default_random_engine;
 using std::uniform_int_distribution;
 using std::bitset;
 
+
+inline ophelib::Integer getMaxBitLength(const ophelib::Integer& a){
+	return a.size_bits();
+}
 
 inline bool checkFileExist (const std::string& name) {
   struct stat buffer;
@@ -33,18 +38,18 @@ inline bool checkFileExist (const std::string& name) {
 // param c:分隔符
 void SplitString(const std::string& s, std::vector<std::string>& v, const std::string& c)
 {
-  std::string::size_type pos1, pos2;
-  pos2 = s.find(c);
-  pos1 = 0;
-  while(std::string::npos != pos2)
-  {
-    v.push_back(s.substr(pos1, pos2-pos1));
- 
-    pos1 = pos2 + c.size();
-    pos2 = s.find(c, pos1);
-  }
-  if(pos1 != s.length())
-    v.push_back(s.substr(pos1));
+	std::string::size_type pos1, pos2;
+	pos2 = s.find(c);
+	pos1 = 0;
+	while(std::string::npos != pos2)
+	{
+		v.push_back(s.substr(pos1, pos2-pos1));
+	
+		pos1 = pos2 + c.size();
+		pos2 = s.find(c, pos1);
+	}
+	if(pos1 != s.length())
+		v.push_back(s.substr(pos1));
 }
 
 /*===================================================================================================*/
@@ -97,12 +102,15 @@ class generator {
 private:
 	default_random_engine e;//随机数引擎
 	KT vmin, vmax;//随机数生成范围
+	uniform_int_distribution<KT> u;
 	ll grid;//最小单位
 public:
-	generator(KT vmin, KT vmax):vmin(vmin),vmax(vmax),grid(100000),e(time(0)){}
+	generator(KT vmin, KT vmax):vmin(vmin),vmax(vmax),grid(100000),e(time(0)), u(vmin, vmax){}
 	void generate_random_vec(vector<KT>& num_vec,size_t start,size_t end) {
-		uniform_int_distribution<KT> u(vmin, vmax);
 		for (auto i = start; i != end; ++i) num_vec[i] = u(e);
+	}
+	KT generate_one(){
+		return u(e);
 	}
 	vector<KT> generate_with_parallel(ll len) {
 		ll tnum = 2;//len / grid;//启用线程数
@@ -146,7 +154,7 @@ public:
 void unique(vector<vector<uint32_t>>&);
 
 //从NYC数据集中抽取PULocationID以及DOLocationID作为二维数据集返回
-vector<vector<uint32_t>> read_from_NYC_csv(const string& path,uint64_t size=10) {
+vector<vector<uint32_t>> read_from_NYC_csv(const string& path, uint64_t size = 10) {
 	std::ifstream inFile(path, std::ios::in);
 	string lineStr;
 	vector<vector<uint32_t>> data(size,vector<uint32_t>(2));
@@ -157,10 +165,6 @@ vector<vector<uint32_t>> read_from_NYC_csv(const string& path,uint64_t size=10) 
 	getline(inFile, lineStr);
 	while (i<size&&getline(inFile, lineStr))
 	{
-		// 打印整行字符串
-		//cout << lineStr << endl;
-		// 存成二维表结构
-		//cout<<inFile.is_open()<<"\n";
 		std::stringstream ss(lineStr);
 		string str;
 		//空过前7列
@@ -221,9 +225,9 @@ vector<vector<uint32_t>> read_from_roadnet_txt(uint64_t size=2000,int dim=2,cons
 		bool flag=false;
 		for(size_t j=0;j<dim;++j){
 			data[i][j] = static_cast<uint32_t>(std::stoul(strs[j]));
-			if(data[i][j]>1000){
-				flag=true;break;
-			}
+			// if(data[i][j]>1000){
+			// 	flag=true;break;
+			// }
 		}
 		if(flag) continue;
 		++i;

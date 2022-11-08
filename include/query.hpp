@@ -15,9 +15,20 @@
 using namespace ophelib;
 using std::vector;
 
-inline Integer getMaxBitLength(const Integer& a){
-	return a.size_bits();
-}
+
+template<uint32_t dim = 2>
+class record {
+public:
+    size_t id;
+    std::array<uint32_t, dim> key;
+};
+
+template<uint32_t dim = 2>
+class encRecord {
+public:
+    size_t id;
+    std::array<Ciphertext, dim> key;
+};
 
 // 查询矩形,矩形格式为[xmin,ymin,zmin,xmax,ymax,zmax]
 template<class KT=uint32_t>
@@ -95,3 +106,15 @@ private:
 	vector<Ciphertext> minvec;
 	vector<Ciphertext> maxvec;
 };
+
+template<uint32_t dim>
+vector<record<dim>> convert(vector<vector<uint32_t>>&& data){
+	vector<record<dim>> ret(data.size());
+	for(size_t i = 0; i < ret.size(); ++i){
+		ret[i].id = i;
+		for(size_t j = 0; j < dim; ++j){
+			ret[i].key[j] = data[i][j];
+		}
+	}
+	return ret;
+}
