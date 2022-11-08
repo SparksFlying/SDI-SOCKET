@@ -73,20 +73,6 @@ public:
 	{
 		static Log olog(prefix);
 		return olog;
-		// if(m_instance == nullptr){
-		// 	m_mutex.lock();
-		// 	if(m_instance == nullptr)
-		// 	{
-		// 		m_instance = new Log(prefix);
-		// 	}
-		// 	m_mutex.unlock();
-		// }
-		// return *m_instance;
-	}
-	
-	void setLogFilePrefix(const string& prefix = "Log")
-	{
-
 	}
 
 	void setLevel(logging::trivial::severity_level level){
@@ -151,12 +137,7 @@ private:
 	boost::log::sources::wseverity_logger_mt<boost::log::trivial::severity_level> m_oWsLogger;
 	std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
 	logging::trivial::severity_level m_level = logging::trivial::severity_level::debug;
-	static Log* m_instance;
-	static std::mutex m_mutex;
 };
-
-Log* Log::m_instance = nullptr;
-std::mutex Log::m_mutex;
  
 Log::Log(const string &sLogFilePfx, const unsigned int nRotSizeInByte)
 {
