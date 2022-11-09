@@ -148,6 +148,50 @@ public:
 	}
 };
 
+template<class T>
+class BitMap
+{
+public:
+	BitMap(){
+		
+	}
+    BitMap(size_t range) : bits(range / sizeof(T) + 1, 0), count(0)
+    {
+        
+    }
+    void set(size_t x)
+    {
+		count++;
+        int index = x / sizeof(T);//确定哪个数据（区间）
+        int temp = x % sizeof(T);//确定哪个Bit位
+        bits[index] |= (1 << temp);//位操作即可
+    }
+    void reset(size_t x)
+    {
+		count--;
+        int index = x / sizeof(T);
+        int temp = x % sizeof(T);
+        bits[index] &= ~(1 << temp);//取反
+    }
+    bool test(size_t x)
+    {
+        int index = x / sizeof(T);
+        int temp = x % sizeof(T);
+        if (bits[index]&(1<<temp))
+            return true;
+        else
+            return false;
+    }
+	size_t getCount()
+	{
+		return count;
+	}
+
+private:
+    vector<T> bits;
+	size_t count;
+};
+
 /*===================================================================================================*/
 /*===============================================数据集读取与结果写入==========================================*/
 /*===================================================================================================*/
