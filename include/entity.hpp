@@ -333,10 +333,11 @@ public:
     void recvKeys(){
         rpc_client cli(config::CA_IP, config::CA_PORT);
         while(!cli.connect());
+        size_t keySize = cli.call<size_t>("getKeySize");
         pair<string, string> param = cli.call<pair<string, string>>("getPub");
         array<string, 4> param2 = cli.call<array<string, 4>>("getPriv");
-        PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
-        PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
+        PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        PrivateKey sk(keySize, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
         info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
@@ -454,13 +455,12 @@ public:
 
     void recvKeys(){
         rpc_client cli(config::CA_IP, config::CA_PORT);
-        while(!cli.connect()){
-
-        }
+        while(!cli.connect());
+        size_t keySize = cli.call<size_t>("getKeySize");
         pair<string, string> param = cli.call<pair<string, string>>("getPub");
         array<string, 4> param2 = cli.call<array<string, 4>>("getPriv");
-        PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
-        PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
+        PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        PrivateKey sk(keySize, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
         info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
@@ -470,6 +470,8 @@ public:
     {
         lock_guard g(m_n2d);
         this->name2data[dataName].resize(dataSize);
+        // init delmap
+        this->name2delmap[dataName] = BitMap<uint64_t>(dataSize);
         auto iter = this->name2data[dataName].begin();
         for(size_t i = 0; i < dataSize; ++i, ++iter){
             iter->second.resize(dim);
@@ -560,12 +562,16 @@ public:
             // std::thread t(&DSP::loadData, this, dataName, config::dataFolder + "/" + dataName + ".dat");
             // if(t.joinable()) t.join();
             loadData(dataName, config::dataFolder + "/" + dataName + ".dat");
+        }else{
+            printf("no such data %s\n", dataName.c_str());
+            return;
         }
         if(checkFileExist(config::dataFolder + "/" + dataName + ".idx")){
             // std::thread t(&DSP::loadIndex, this, dataName, config::dataFolder + "/" + dataName + ".idx");
             // if(t.joinable()) t.join();
             loadIndex(dataName, config::dataFolder + "/" + dataName + ".idx");
         }
+        printf("load %s done\n", dataName.c_str());
     }
 
     void saveData(const string& dataName, const string& filePath){
@@ -574,9 +580,12 @@ public:
             info("open %s failed!", filePath.c_str());
             return;
         }
-        lock_guard<mutex> g(m_n2d);
-        out << name2data[dataName].size() << ' ' << name2data[dataName].begin()->second.size() << ' ';
-        std::for_each(name2data[dataName].begin(), name2data[dataName].end(), [&out](const pair<size_t, vector<Ciphertext>>& item){
+        std::lock(m_n2d, m_n2dm);
+        out << name2data[dataName].size() - name2delmap[dataName].getCount() << ' ' << name2data[dataName].begin()->second.size() << ' ';
+
+
+        std::for_each(name2data[dataName].begin(), name2data[dataName].end(), [&out, dataName, this](const pair<size_t, vector<Ciphertext>>& item){
+            if(this->name2delmap[dataName].test(item.first)) return;
             out << item.first << ' ';
             for(size_t i = 0; i < item.second.size(); ++i){
                 out << item.second[i].data.get_str() << ' ';
@@ -646,6 +655,10 @@ public:
     }
 
     Ciphertext checkData(const string& dataName, const EQueryRectangle& QR, const size_t& id){
+        {
+            lock_guard g(m_n2dm);
+            if(name2delmap[dataName].test(id)) return crypto->encrypt(0);
+        }
         Ciphertext res = crypto->encrypt(0);
         auto iter = this->id2data.find(dataName)->second.find(id)->second;
         for(size_t i = 0; i < iter->second.size(); ++i){
@@ -700,29 +713,50 @@ public:
             return {SUCCESS, {}};
         }
 
-        Vec<PackedCiphertext> packedCmpResult = packSearching(dataName, posInfo, limits);
-        vector<size_t> results{};
-        {
-            Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+        // parallel pack searching
+        size_t numTasks = (posInfo.second - posInfo.first + 1 - 1) / config::NUM_ONE_BATCH + 1;
+        vector<std::future<Vec<PackedCiphertext>>> futs(numTasks);
+        vector<pair<size_t, size_t>> splitedPosInfo(numTasks);
+        for(size_t i = 0; i < numTasks; ++i){
+            splitedPosInfo[i] = pair<size_t, size_t>(posInfo.first + i * config::NUM_ONE_BATCH, std::min(posInfo.first + (i + 1) * config::NUM_ONE_BATCH - 1, posInfo.second));
+            futs[i] = std::async(&DSP::packSearching, this, dataName, splitedPosInfo[i], limits);
+        }
 
-            
-            // if(config::LOG){
-            //     string idxStr, cmpResultStr;
-            //     for(size_t i = 0; i < cmpResult.length(); ++i){
-            //         idxStr += std::to_string(i) + " ";
-            //         cmpResultStr += cmpResult[i].get_str() + " ";
-            //     }
-            //     //debug(idxStr.c_str());
-            //     //debug(cmpResultStr.c_str());
-            // }
-            for(size_t posIdx = posInfo.first; posIdx <= posInfo.second; ++posIdx){
-                if(cmpResult[posIdx - posInfo.first] == 2 * name2data[dataName].begin()->second.size()){
+        vector<size_t> results{};
+        size_t dim = name2data[dataName].begin()->second.size();
+        for(size_t i = 0; i < numTasks; ++i){
+            Vec<PackedCiphertext> packedCmpResult = futs[i].get();
+            Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+            for(size_t posIdx = splitedPosInfo[i].first; posIdx <= splitedPosInfo[i].second; ++posIdx){
+                if(cmpResult[posIdx - splitedPosInfo[i].first] == 2 * dim){
                     results.push_back(posIdx);
                 }
             }
-            //debug("decrypt packed cmpResult size is %lld, res size is %lu", cmpResult.length(), results.size());
         }
 
+
+        // Vec<PackedCiphertext> packedCmpResult = packSearching(dataName, posInfo, limits);
+        // vector<size_t> results{};
+        // {
+        //     Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+
+            
+        //     // if(config::LOG){
+        //     //     string idxStr, cmpResultStr;
+        //     //     for(size_t i = 0; i < cmpResult.length(); ++i){
+        //     //         idxStr += std::to_string(i) + " ";
+        //     //         cmpResultStr += cmpResult[i].get_str() + " ";
+        //     //     }
+        //     //     //debug(idxStr.c_str());
+        //     //     //debug(cmpResultStr.c_str());
+        //     // }
+        //     for(size_t posIdx = posInfo.first; posIdx <= posInfo.second; ++posIdx){
+        //         if(cmpResult[posIdx - posInfo.first] == 2 * name2data[dataName].begin()->second.size()){
+        //             results.push_back(posIdx);
+        //         }
+        //     }
+        // }
+        //debug("decrypt packed cmpResult size is %lld, res size is %lu", cmpResult.length(), results.size());
         pair<int, vector<size_t>> ret{SUCCESS, std::move(results)};
         return ret;
     }
@@ -778,6 +812,7 @@ public:
         return {};
     }
 
+    // insert an item
     int insert(rpc_conn conn, const string& dataName, pair<size_t, vector<string>>&& item, const size_t& posIdx, const size_t& segIdx){
         std::lock(m_n2d, m_i2d);
         pair<size_t, vector<Ciphertext>> tmp{item.first, vector<Ciphertext>(item.second.size())};
@@ -787,7 +822,8 @@ public:
         auto newIter = name2data[dataName].insert(iter, std::move(tmp));
         id2data[dataName][item.first] = newIter;
         
-        // segIdx not finish
+        // update index nodes
+        updateNodes(dataName, segIdx);
 
         name2count[dataName]++;
         return SUCCESS;
@@ -808,6 +844,12 @@ public:
             if(curIdx == targetIdx) update = true;
         }
         if(2 * curIdx + 1 < index.size()) recurUpdateNodes(index, 2 * curIdx + 1, targetIdx, update);
+    }
+
+    // delete data item
+    int del(rpc_conn conn, const string& dataName, size_t id){
+        lock_guard g(m_n2dm);
+        name2delmap[dataName].set(id);
     }
 
     // secure multiply protocol
@@ -950,7 +992,7 @@ public:
         return ret == 0 ? RIGHT : LEFT;
     }
 
-    // 压缩乘法
+    
     Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input, bool whichPred = 0){
         //debug("dsp CAP start");
         //debug("input = %s", crypto->decrypt(input).get_str().c_str());
@@ -1040,20 +1082,22 @@ public:
     PaillierFast* crypto;
     rpc_client dap_;
 
-    // dataname to data
+    // dataname to data: each item represents a pair of data id and its enc key
     map<string, list<pair<size_t, vector<Ciphertext>>>> name2data;
     // dataname to index
     map<string, vector<shared_ptr<encSegmentNode>>> name2index;
-    // data id to iterator of data
+    // data id to iterator of data: id -> iterator of data item
     map<string, map<size_t, list<pair<size_t, vector<Ciphertext>>>::iterator>> id2data;
-    // 
+    // bitmap for deleted flags: id -> {0, 1} (1 represents deleted)
+    map<string, BitMap<uint64_t>> name2delmap;
 
     // lock for above data structs
     mutex m_n2d;
     mutex m_n2i;
     mutex m_i2d;
+    mutex m_n2dm;
 
-    // actually recv how many data
+    // actually recv how many data items and index nodes
     map<string, std::atomic<size_t>> name2count;
 
 
@@ -1195,14 +1239,14 @@ public:
     void recvKeys(){
         rpc_client cli(config::CA_IP, config::CA_PORT);
         while(!cli.connect());
+        size_t keySize = cli.call<size_t>("getKeySize");
         pair<string, string> param = cli.call<pair<string, string>>("getPub");
         array<string, 4> param2 = cli.call<array<string, 4>>("getPriv");
-        PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
-        PrivateKey sk(config::KEY_SIZE, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
+        PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        PrivateKey sk(keySize, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
         crypto = new PaillierFast(pk, sk);
         info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
-        
     }
 };
 
@@ -1215,9 +1259,9 @@ public:
     void recvPubKey(){
         rpc_client ca(config::CA_IP, config::CA_PORT);
         while(!ca.connect());
-        
+        size_t keySize = ca.call<size_t>("getKeySize");
         pair<string, string> param = ca.call<pair<string, string>>("getPub");
-        PublicKey pk(config::KEY_SIZE, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
         crypto = new PaillierFast(pk);
     }
     void query(const string& dataName, const QueryRectangle<uint32_t>& QR){
@@ -1292,8 +1336,57 @@ class CA : public rpc_server{
 public:
     CA(const uint32_t key_size = config::KEY_SIZE) : rpc_server(config::CA_PORT, 1), crypto(new PaillierFast(key_size)){
         crypto->generate_keys();
+        this->register_handler("getKeySize", &CA::getKeySize, this);
         this->register_handler("getPub", &CA::getPub, this);
         this->register_handler("getPriv", &CA::getPriv, this);
+    }
+    void saveKeys(const string& filePath){
+        std::ofstream out(filePath, std::ios::out | std::ios::binary);
+        if(!out.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        // save key size
+        out << crypto->get_pub().key_size_bits << ' ';
+        // save pub key
+        out << crypto->get_pub().n.get_str() << ' ' << crypto->get_pub().g.get_str() << ' ';
+        // save priv key
+        out << std::to_string(crypto->get_priv().a_bits) << ' ';
+        out << crypto->get_priv().p.get_str() << ' ';
+        out << crypto->get_priv().q.get_str() << ' ';
+        out << crypto->get_priv().a.get_str();
+        out.close();
+        info("save done\n");
+    }
+    CA(const string& filePath) : rpc_server(config::CA_PORT, 1){
+        readKeys(filePath);
+        this->register_handler("getKeySize", &CA::getKeySize, this);
+        this->register_handler("getPub", &CA::getPub, this);
+        this->register_handler("getPriv", &CA::getPriv, this);
+    }
+    void readKeys(const string& filePath){
+        std::ifstream in(filePath, std::ios::in | std::ios::binary);
+        if(!in.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        size_t keySize;
+        pair<string, string> param;
+        array<string, 4> param2;
+
+        in >> keySize;
+        in >> param.first >> param.second;
+        for(size_t i = 0; i < 4; ++i){
+            in >> param2[i];
+        }
+        PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
+        PrivateKey sk(keySize, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
+
+        crypto = new PaillierFast(pk, sk);
+        info("read done\n");
+    }
+    size_t getKeySize(rpc_conn conn){
+        return crypto->get_pub().key_size_bits;
     }
     pair<string, string> getPub(rpc_conn conn){
         return {crypto->get_pub().n.get_str(), crypto->get_pub().g.get_str()};

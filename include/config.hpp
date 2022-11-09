@@ -25,6 +25,7 @@ namespace config{
 
     constexpr size_t FLOAT_EXP = 30;
     constexpr size_t NUM_THREADS = 4;
+    constexpr size_t NUM_ONE_BATCH = 100;
     constexpr bool LOG = false;
     constexpr bool PARAL = true;
 
