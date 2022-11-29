@@ -74,6 +74,9 @@ private:
 // 查询矩形,矩形格式为[xmin,ymin,zmin,xmax,ymax,zmax]
 class EQueryRectangle{
 public:
+	EQueryRectangle(size_t dim): dim(dim), minvec(vector<Ciphertext>(dim)), maxvec(vector<Ciphertext>(dim)){
+
+	}
 	EQueryRectangle(const vector<Ciphertext>& vals) : dim(vals.size() / 2), minvec(vector<Ciphertext>(dim)), maxvec(vector<Ciphertext>(dim)){
 		for(size_t i = 0; i < dim; ++i){
 			minvec[i] = vals[i];
@@ -101,7 +104,14 @@ public:
 	const vector<Ciphertext>& get_maxvec()const{
 		return maxvec;
 	}
-private:
+
+	void set_minvec(size_t i, const Ciphertext& c){
+		minvec[i] = c;
+	}
+	void set_maxvec(size_t i, const Ciphertext& c){
+		maxvec[i] = c;
+	}
+public:
 	int dim;
 	vector<Ciphertext> minvec;
 	vector<Ciphertext> maxvec;

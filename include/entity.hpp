@@ -57,6 +57,7 @@ enum STATUS{
     DUPLICATE
 };
 
+static TimerClock tc;
 
 
 template<uint32_t dim = 2>
@@ -145,7 +146,11 @@ public:
     void outSource()
     {
         //debug("do outsource start");
-        auto idx = buildIndex();
+        {
+            tc.update();
+            auto idx = buildIndex();
+            info("data size is %lu, build index cost %.3f", this->data_.size(), tc.getTimerMilliSec());
+        }
         vector<pair<pair<size_t, size_t>, string>> encDataBlocks;
         vector<pair<pair<size_t, size_t>, string>> indexBlocks;
         {
@@ -175,16 +180,20 @@ public:
         dsp_.call("recvDataInfo", dataName, this->data_.size(), dim);
         dsp_.call("recvIndexInfo", dataName, plainIndex.size());
 
+        vector<rest_rpc::future_result<rest_rpc::req_result>> futs(encDataBlocks.size() + indexBlocks.size());
         // 分批发送数据
         for(size_t i = 0; i < encDataBlocks.size(); ++i)
         {
-            dsp_.async_call<FUTURE>("recvData", dataName, encDataBlocks[i]);
+            futs[i] = dsp_.async_call<FUTURE>("recvData", dataName, encDataBlocks[i]);
         }
 
         // 分批发送索引
         for(size_t i = 0; i < indexBlocks.size(); ++i)
         {
-            dsp_.async_call<FUTURE>("recvIndex", dataName, indexBlocks[i]);
+            futs[i + encDataBlocks.size()] = dsp_.async_call<FUTURE>("recvIndex", dataName, indexBlocks[i]);
+        }
+        for(auto& fut: futs){
+            fut.get();
         }
         //debug("do outsource end");
     }
@@ -440,9 +449,11 @@ public:
         dap_.enable_auto_heartbeat(true);
         while(!dap_.connect());
 
-        load("car-unique");
+        //load("car-unique");
 
         //CAP(name2index["car-unique"], crypto->encrypt(859317976), 0);
+
+        this->threshold = std::thread::hardware_concurrency() * config::NUM_ONE_BATCH * 10;
 
         this->register_handler("recvData", &DSP::recvData, this);
         this->register_handler("recvIndex", &DSP::recvIndex, this);
@@ -668,6 +679,97 @@ public:
         return res;
 	}
 
+    size_t predict(const string& dataName, const Ciphertext& input, bool whichPred){
+        Ciphertext encPos = CAP(name2index[dataName], input, whichPred);
+        // Integer pos(dap_.call<string>("DEC", encPos.data.get_str()).c_str());
+        Integer pos(this->DEC(encPos.data.get_str()).c_str());
+
+        pos /= Integer(10).pow(config::FLOAT_EXP);
+        pos -= Integer(config::EPSILON);
+        pos = pos < 0 ? 0 : pos;
+        pos = pos < Integer(name2data[dataName].size()) ? pos : Integer(name2data[dataName].size()) - 1;
+        return pos.to_ulong();
+    }
+
+    pair<size_t, size_t> predictRange(const string& dataName, const pair<Ciphertext, Ciphertext>& range){
+        pair<size_t, size_t> posInfo;
+
+        std::future<size_t> fut1 = std::async(&DSP::predict, this, dataName, range.first, 0);
+        std::future<size_t> fut2 = std::async(&DSP::predict, this, dataName, range.second, 1);
+
+        posInfo.first = fut1.get();
+        posInfo.second = fut2.get();
+
+        return posInfo;
+    }
+
+    vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>> genSearchTasks(const string& dataName, const pair<size_t, size_t>& posInfo, const EQueryRectangle& EQR){
+        debug("[%lu, %lu]", posInfo.first, posInfo.second);
+        // parallel pack searching
+        size_t numTasks = (posInfo.second - posInfo.first + 1 - 1) / config::NUM_ONE_BATCH + 1;
+        vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>> futs(numTasks);
+        for(size_t i = 0; i < numTasks; ++i){
+            futs[i].second = pair<size_t, size_t>(posInfo.first + i * config::NUM_ONE_BATCH, std::min(posInfo.first + (i + 1) * config::NUM_ONE_BATCH - 1, posInfo.second));
+            futs[i].first = std::async(&DSP::packSearching, this, dataName, futs[i].second, EQR);
+        }
+        return futs;
+    }
+
+    void unpack(vector<size_t>& results, pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>& fut, const string& dataName){
+        size_t dim = name2data[dataName].begin()->second.size();
+        Vec<PackedCiphertext> packedCmpResult = fut.first.get();
+        Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+        debug("[%lu, %lu], cmp size = %lld", fut.second.first, fut.second.second, cmpResult.length());
+        for(size_t posIdx = fut.second.first; posIdx <= fut.second.second; ++posIdx){
+            if(cmpResult[posIdx - fut.second.first] == 2 * dim){
+                results.push_back(posIdx);
+            }
+        }
+        debug("unpack done");
+    }
+
+    void split(const string& dataName, vector<pair<size_t, size_t>>& posInfos, const pair<size_t, size_t>& posInfo, const EQueryRectangle& EQR){
+        if(posInfo.first > posInfo.second) return;
+        if(posInfo.second - posInfo.first + 1 <= threshold){
+            debug("[%lu, %lu]", posInfo.first, posInfo.second);
+            posInfos.emplace_back(posInfo.first, posInfo.second);
+        }else{
+            auto splitedEQRs = splitQR(EQR);
+            Ciphertext firstEnd = encode(splitedEQRs.first.get_maxvec());
+            Ciphertext secondStart = encode(splitedEQRs.second.get_minvec());
+            
+            std::future<size_t> fut1 = std::async(&DSP::predict, this, dataName, firstEnd, 1);
+            std::future<size_t> fut2 = std::async(&DSP::predict, this, dataName, secondStart, 0);
+
+            size_t firstEndPos = fut1.get();
+            size_t secondStartPos = fut2.get();
+
+            split(dataName, posInfos, pair<size_t, size_t>{posInfo.first, firstEndPos}, splitedEQRs.first);
+            split(dataName, posInfos, pair<size_t, size_t>{secondStartPos, posInfo.second}, splitedEQRs.second);
+        }
+    }
+
+    pair<EQueryRectangle, EQueryRectangle> splitQR(const EQueryRectangle& EQR){
+        size_t dim = EQR.dim;
+        Integer r = Random::instance().rand_int(10) % Integer(dim);
+        pair<EQueryRectangle, EQueryRectangle> ret{EQueryRectangle(dim), EQueryRectangle(dim)};
+        Ciphertext midVal = divide(EQR.get_minvec()[r.to_uint()].data * EQR.get_maxvec()[r.to_uint()].data, 2);
+        for(size_t i = 0; i < dim; ++i){
+            if(i == r){
+                ret.first.set_minvec(i, EQR.get_minvec()[i]);
+                ret.first.set_maxvec(i, midVal);
+                ret.second.set_minvec(i, midVal);
+                ret.second.set_minvec(i, EQR.get_maxvec()[i]);
+            }else{
+                ret.first.set_minvec(i, EQR.get_minvec()[i]);
+                ret.first.set_maxvec(i, EQR.get_maxvec()[i]);
+                ret.second.set_minvec(i, EQR.get_minvec()[i]);
+                ret.second.set_maxvec(i, EQR.get_maxvec()[i]);
+            }
+        }
+        return ret;
+    }
+
     pair<int, vector<size_t>> rangeQuery(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
         info("recv request from %s", conn.lock()->remote_address().c_str());
         if(!name2index.count(dataName)){
@@ -677,96 +779,49 @@ public:
             return {NOTCOMPLATE, {}};
         }
 
-        pair<Ciphertext, Ciphertext> encPosInfo;
-        if(config::PARAL){
-            std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
-            std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
-            encPosInfo.first = fut1.get();
-            encPosInfo.second = fut2.get();
-        }else{
-            encPosInfo.first = CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
-            encPosInfo.second = CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
-        }
+        pair<Ciphertext, Ciphertext> encRange{Ciphertext(Integer(range.first.c_str())), Ciphertext(Integer(range.second.c_str()))};
+        EQueryRectangle EQR(limits);
+        // predict
+        pair<size_t, size_t> posInfo = predictRange(dataName, encRange);
 
-        Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
-        Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
-
-        
-        //debug("predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
-
-        {
-            startPos /= Integer(10).pow(config::FLOAT_EXP);
-            startPos -= Integer(config::EPSILON);
-            if(startPos < 0) startPos = 0;
-        }
-        {
-            endPos /= Integer(10).pow(config::FLOAT_EXP);
-            endPos += Integer(config::EPSILON);
-            if(endPos >= Integer(name2data[dataName].size())) endPos = Integer(name2data[dataName].size()) - 1;
-        }
-        pair<size_t, size_t> posInfo{startPos.to_ulong(), endPos.to_ulong()};
-
-        //debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
         // result empty
         if(posInfo.first > posInfo.second)
         {
             return {SUCCESS, {}};
         }
 
-        // parallel pack searching
-        size_t numTasks = (posInfo.second - posInfo.first + 1 - 1) / config::NUM_ONE_BATCH + 1;
-        vector<std::future<Vec<PackedCiphertext>>> futs(numTasks);
-        vector<pair<size_t, size_t>> splitedPosInfo(numTasks);
-        for(size_t i = 0; i < numTasks; ++i){
-            splitedPosInfo[i] = pair<size_t, size_t>(posInfo.first + i * config::NUM_ONE_BATCH, std::min(posInfo.first + (i + 1) * config::NUM_ONE_BATCH - 1, posInfo.second));
-            futs[i] = std::async(&DSP::packSearching, this, dataName, splitedPosInfo[i], limits);
-        }
+        debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
 
-        vector<size_t> results{};
-        size_t dim = name2data[dataName].begin()->second.size();
-        for(size_t i = 0; i < numTasks; ++i){
-            Vec<PackedCiphertext> packedCmpResult = futs[i].get();
-            Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
-            for(size_t posIdx = splitedPosInfo[i].first; posIdx <= splitedPosInfo[i].second; ++posIdx){
-                if(cmpResult[posIdx - splitedPosInfo[i].first] == 2 * dim){
-                    results.push_back(posIdx);
+        // if search range over threshold, then split, else pack search
+        vector<size_t> results;
+        if(posInfo.second - posInfo.first + 1 <= threshold){
+            vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>> futs = genSearchTasks(dataName, posInfo, EQR);          
+            debug("gen done");
+            for(size_t i = 0; i < futs.size(); ++i){
+                unpack(results, futs[i], dataName);
+            }
+        }else{
+            vector<pair<size_t, size_t>> posInfos;
+            split(dataName, posInfos, posInfo, EQR);
+            vector<vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>>> futs(posInfos.size());
+            for(size_t i = 0; i < posInfos.size(); ++i){
+                futs[i] = genSearchTasks(dataName, posInfos[i], EQR);
+            }
+            for(size_t i = 0; i < posInfos.size(); ++i){
+                for(size_t j = 0; j < futs[i].size(); ++j){
+                    unpack(results, futs[i][j], dataName);
                 }
             }
         }
-
-
-        // Vec<PackedCiphertext> packedCmpResult = packSearching(dataName, posInfo, limits);
-        // vector<size_t> results{};
-        // {
-        //     Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
-
-            
-        //     // if(config::LOG){
-        //     //     string idxStr, cmpResultStr;
-        //     //     for(size_t i = 0; i < cmpResult.length(); ++i){
-        //     //         idxStr += std::to_string(i) + " ";
-        //     //         cmpResultStr += cmpResult[i].get_str() + " ";
-        //     //     }
-        //     //     //debug(idxStr.c_str());
-        //     //     //debug(cmpResultStr.c_str());
-        //     // }
-        //     for(size_t posIdx = posInfo.first; posIdx <= posInfo.second; ++posIdx){
-        //         if(cmpResult[posIdx - posInfo.first] == 2 * name2data[dataName].begin()->second.size()){
-        //             results.push_back(posIdx);
-        //         }
-        //     }
-        // }
-        //debug("decrypt packed cmpResult size is %lld, res size is %lu", cmpResult.length(), results.size());
         pair<int, vector<size_t>> ret{SUCCESS, std::move(results)};
         return ret;
     }
 
-    Vec<PackedCiphertext> packSearching(const string& dataName, const pair<size_t, size_t>& posInfo, const vector<string>& limits)
+    Vec<PackedCiphertext> packSearching(const string& dataName, const pair<size_t, size_t>& posInfo, const EQueryRectangle& EQR)
     {
         //debug("packing SVC start");
         size_t dim = name2data[dataName].begin()->second.size();
         size_t n = posInfo.second - posInfo.first + 1;
-        EQueryRectangle eQR(limits);
         // 将数据以列重新排列
         vector<Vec<Ciphertext>> encData(dim, Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n));
         vector<Vec<Ciphertext>> lowLimits(dim);
@@ -781,8 +836,8 @@ public:
         }
 
         for(size_t i = 0; i < dim; ++i){
-            lowLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, eQR.get_minvec()[i]));
-            highLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, eQR.get_maxvec()[i]));
+            lowLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, EQR.get_minvec()[i]));
+            highLimits[i] = std::move(Vec<Ciphertext>(NTL::INIT_SIZE_TYPE{}, n, EQR.get_maxvec()[i]));
         }
 
         size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
@@ -808,8 +863,77 @@ public:
         return ret;
     }
 
-    vector<vector<uint32_t>> rangeQueryOpt(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
-        return {};
+    pair<int, vector<size_t>> rangeQueryOpt(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        info("recv request from %s", conn.lock()->remote_address().c_str());
+        if(!name2index.count(dataName)){
+            return {NOSUCHDATA, {}};
+        }
+        if(name2count[dataName] != name2data[dataName].size() + name2index[dataName].size()){
+            return {NOTCOMPLATE, {}};
+        }
+
+        EQueryRectangle EQR(limits);
+        pair<Ciphertext, Ciphertext> encPosInfo;
+        if(config::PARAL){
+            std::future<Ciphertext> fut1 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
+            std::future<Ciphertext> fut2 = std::async(&DSP::CAP, this, name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
+            encPosInfo.first = fut1.get();
+            encPosInfo.second = fut2.get();
+        }else{
+            encPosInfo.first = CAP(name2index[dataName], Ciphertext(Integer(range.first.c_str())), 0);
+            encPosInfo.second = CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
+        }
+
+        // Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
+        // Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
+        Integer startPos(this->DEC(encPosInfo.first.data.get_str()).c_str());
+        Integer endPos(this->DEC(encPosInfo.second.data.get_str()).c_str());
+
+        
+        //debug("predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
+
+        {
+            startPos /= Integer(10).pow(config::FLOAT_EXP);
+            startPos -= Integer(config::EPSILON);
+            if(startPos < 0) startPos = 0;
+        }
+        {
+            endPos /= Integer(10).pow(config::FLOAT_EXP);
+            endPos += Integer(config::EPSILON);
+            if(endPos >= Integer(name2data[dataName].size())) endPos = Integer(name2data[dataName].size()) - 1;
+        }
+        pair<size_t, size_t> posInfo{startPos.to_ulong(), endPos.to_ulong()};
+
+        debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+        // result empty
+        if(posInfo.first > posInfo.second)
+        {
+            return {SUCCESS, {}};
+        }
+
+        // parallel pack searching
+        size_t numTasks = (posInfo.second - posInfo.first + 1 - 1) / config::NUM_ONE_BATCH + 1;
+        vector<std::future<Vec<PackedCiphertext>>> futs(numTasks);
+        vector<pair<size_t, size_t>> splitedPosInfo(numTasks);
+        for(size_t i = 0; i < numTasks; ++i){
+            splitedPosInfo[i] = pair<size_t, size_t>(posInfo.first + i * config::NUM_ONE_BATCH, std::min(posInfo.first + (i + 1) * config::NUM_ONE_BATCH - 1, posInfo.second));
+            futs[i] = std::async(&DSP::packSearching, this, dataName, splitedPosInfo[i], EQR);
+        }
+
+        vector<size_t> results{};
+        size_t dim = name2data[dataName].begin()->second.size();
+        for(size_t i = 0; i < numTasks; ++i){
+            Vec<PackedCiphertext> packedCmpResult = futs[i].get();
+            Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+            for(size_t posIdx = splitedPosInfo[i].first; posIdx <= splitedPosInfo[i].second; ++posIdx){
+                if(cmpResult[posIdx - splitedPosInfo[i].first] == 2 * dim){
+                    results.push_back(posIdx);
+                }
+            }
+        }
+
+        pair<int, vector<size_t>> ret{SUCCESS, std::move(results)};
+        return ret;
     }
 
     // insert an item
@@ -860,7 +984,8 @@ public:
         Integer rb = r.rand_int(crypto->get_pub().n);
         Ciphertext tmp_a=crypto->encrypt(ra).data * a.data;
         Ciphertext tmp_b=crypto->encrypt(rb).data * b.data;
-        Ciphertext h = Integer(dap_.call<string>("SM", tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
+        // Ciphertext h = Integer(dap_.call<string>("SM", tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
+        Ciphertext h = Integer(this->SM(tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
 
         auto s = h.data * a.data.pow_mod_n(crypto->get_pub().n - rb, *crypto->get_n2());
         auto tmp_s = s * b.data.pow_mod_n(crypto->get_pub().n - ra, *crypto->get_n2());
@@ -901,7 +1026,8 @@ public:
         Integer r = Random::instance().rand_int(crypto->get_pub().n - 1) % (Integer(2).pow(maxBitLength)) + 1;
         Ciphertext c = _times(Z, r);
 
-        Ciphertext ret = Integer(dap_.call<string>("SIC", c.data.get_str()).c_str());
+        // Ciphertext ret = Integer(dap_.call<string>("SIC", c.data.get_str()).c_str());
+        Ciphertext ret = Integer(this->SIC(c.data.get_str()).c_str());
         if(coin == 0){
             ret = SMinus(crypto->encrypt(1), ret);
         }
@@ -953,7 +1079,8 @@ public:
         for(size_t i = 0; i < C.size(); ++i){
             seriC[i] = C[i].data.data.get_str();
         }
-        vector<string> packedCmpResult = dap_.call<vector<string>>("SVC", seriC);
+        // vector<string> packedCmpResult = dap_.call<vector<string>>("SVC", seriC);
+        vector<string> packedCmpResult = this->SVC(seriC);
 
         //debug("call dap SVC finish");
 
@@ -988,20 +1115,13 @@ public:
         Integer r = Random::instance().rand_int(crypto->get_pub().n) % Integer(2);
         Ciphertext f = SM(SMinus(crypto->encrypt(1), F), pf).data * SM(F, crypto->encrypt(r)).data;
 
-        Integer ret(dap_.call<string>("DEC", f.data.get_str().c_str()) .c_str());
+        // Integer ret(dap_.call<string>("DEC", f.data.get_str().c_str()) .c_str());
+        Integer ret(this->DEC(f.data.get_str().c_str()).c_str());
         return ret == 0 ? RIGHT : LEFT;
     }
 
     
     Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input, bool whichPred = 0){
-        //debug("dsp CAP start");
-        //debug("input = %s", crypto->decrypt(input).get_str().c_str());
-
-        // if(!dap_.has_connected()){
-        //     //debug("reconnect to dap");
-        //     while(!dap_.connect());
-        // }
-
         Ciphertext P = crypto->encrypt(0);
         Ciphertext F = crypto->encrypt(0);
 
@@ -1022,43 +1142,6 @@ public:
         //debug("dsp CAP end");
         return P;
     }
-    // Ciphertext CAP(const vector<shared_ptr<encSegmentNode>>& index, const Ciphertext& input, bool whichPred = 0){
-    //     debug("input = %s", crypto->decrypt(input).get_str().c_str());
-    //     size_t n = std::log2(index.size() + 1);
-    //     size_t plaintext_bits = 100;
-    //     size_t numIntegerPerCiphertext = Vector::pack_count(plaintext_bits, *(this->crypto));
-    //     Vec<Ciphertext> flags(NTL::INIT_SIZE_TYPE{}, numIntegerPerCiphertext, crypto->encrypt(Integer(2).pow(plaintext_bits - 1)));
-    //     Vec<Ciphertext> slopes(NTL::INIT_SIZE_TYPE{}, numIntegerPerCiphertext, crypto->encrypt(Integer(2).pow(plaintext_bits - 1)));
-    //     Vec<Ciphertext> bs(NTL::INIT_SIZE_TYPE{}, numIntegerPerCiphertext, crypto->encrypt(Integer(2).pow(plaintext_bits - 1)));
-        
-    //     Ciphertext F = crypto->encrypt(0);
-    //     size_t cur = 0;
-    //     size_t idx = 0;
-    //     while(cur < index.size()){
-    //         Ciphertext f = SCO(index[cur], input);
-    //         debug("cur = %lu, f = %s, pred1 = [%s, %s]", cur, crypto->decrypt(f).get_str().c_str(), (crypto->decrypt(index[cur]->pred1.first) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (crypto->decrypt(index[cur]->pred1.second) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
-    //         flags[idx].data *= f.data;
-    //         F.data *= f.data;
-    //         if(whichPred == 0){
-    //             slopes[idx].data *= index[cur]->pred1.first.data;
-    //             bs[idx].data *= index[cur]->pred1.second.data;
-    //         }else{
-    //             slopes[idx].data *= index[cur]->pred2.first.data;
-    //             bs[idx].data *= index[cur]->pred2.second.data;
-    //         }
-    //         if(SPFT(index, cur, F, input) == LEFT){
-    //             cur = 2 * cur + 1;
-    //         }else{
-    //             cur = 2 * cur + 2;
-    //         }
-    //         idx++;
-    //     }
-        
-    //     Ciphertext sl = SVM(flags, slopes, plaintext_bits);
-    //     Ciphertext b = SVM(flags, bs, plaintext_bits);
-    //     debug("final sl = %s, b = %s", (crypto->decrypt(sl) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (crypto->decrypt(sl) / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
-    //     return SM(sl, input).data * b.data;
-    // }
 
     Ciphertext SVM(const Vec<Ciphertext>& a, const Vec<Ciphertext>& b, size_t plaintext_bits = 100){
         assert(a.length() == b.length());
@@ -1074,9 +1157,146 @@ public:
             seriPackedB[i] = packedB[i].data.data.get_str();
         }
 
-        string tmp = dap_.call<string>("SVM", seriPackedA, seriPackedB, plaintext_bits);
+        // string tmp = dap_.call<string>("SVM", seriPackedA, seriPackedB, plaintext_bits);
+        string tmp = this->SVM(seriPackedA, seriPackedB, plaintext_bits);
         return Integer(tmp.c_str());
     }
+
+    Ciphertext divide(const Ciphertext& a, int b){
+        // string tmp = dap_.call<string>("DEC", a.data.get_str());
+        string tmp = this->DEC(a.data.get_str());
+        return crypto->encrypt(Integer(tmp.c_str()) / b);
+    }
+    Ciphertext encode(const vector<Ciphertext>& key){
+        vector<string> keyStr(key.size());
+        for(size_t i = 0; i < key.size(); ++i){
+            keyStr[i] = key[i].data.get_str();
+        }
+        // string tmp = dap_.call<string>("SE", keyStr);
+        string tmp = this->SE(std::move(keyStr));
+        return Ciphertext(Integer(tmp.c_str()));
+    }
+
+    /*****************************************************************************************************/
+    // to exactly calc time of computing (without communication time and cost), move DAP's functions to DSP
+    /*****************************************************************************************************/
+    string SM(const string& a, const string& b){
+        //debug("call SM from %s", conn.lock()->remote_address().c_str());
+        //printf("call SM from %s", conn.lock()->remote_address().c_str());
+        Integer ha = crypto->decrypt(Integer(a.c_str()) % *crypto->get_n2());
+        Integer hb = crypto->decrypt(Integer(b.c_str()) % *crypto->get_n2());
+        Integer h = (ha * hb) % crypto->get_pub().n;
+        return crypto->encrypt(h).data.get_str();
+    }
+
+    string SIC(const string& c){
+        //debug("call SIC from %s", conn.lock()->remote_address().c_str());
+        //printf("call SIC from %s", conn.lock()->remote_address().c_str());
+        Integer m = crypto->decrypt(Ciphertext(Integer(c.c_str()))) % crypto->get_pub().n;
+        Integer u = 0;
+        if(getMaxBitLength(m >= 0 ? m : -m) > getMaxBitLength(crypto->get_pub().n) / 2){
+            u = 1;
+        }
+        return crypto->encrypt(u).data.get_str();
+    }
+
+    string DEC(const string& c){
+        //debug("call DEC from %s", conn.lock()->remote_address().c_str());
+        //printf("call DEC from %s", conn.lock()->remote_address().c_str());
+        return crypto->decrypt(Integer(c.c_str())).get_str();
+    }
+
+    vector<string> SVC(const vector<string>& C){
+        //debug("call SVC from %s", conn.lock()->remote_address().c_str());
+        //printf("call SVC from %s", conn.lock()->remote_address().c_str());
+        vector<Vec<Integer>> M(C.size());
+        vector<string> ret(M.size());
+        size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
+        for(size_t i = 0; i < C.size(); ++i){
+            PackedCiphertext packed(Integer(C[i].c_str()), numIntegerPerCiphertext, 32);
+            M[i] = Vector::decrypt_pack(packed, *(this->crypto));
+
+            if(config::LOG){
+                string content;
+                for(size_t j = 0; j < M[i].length(); ++j){
+                    content += (M[i][j] - Integer(2).pow(32 - 1)).get_str() + " ";
+                }
+                //debug(content.c_str());
+            }
+
+            Vec<Integer> packedCmpResult(NTL::INIT_SIZE_TYPE{}, M[i].length(), 0);
+            for(size_t j = 0; j < numIntegerPerCiphertext; ++j){
+                M[i][j] -= Integer(2).pow(32 - 1);
+                if(getMaxBitLength(M[i][j] % crypto->get_pub().n) > getMaxBitLength(crypto->get_pub().n) / 2){
+                    packedCmpResult[j] = 1;
+                }
+            }
+            
+
+            if(config::LOG){
+                string content;
+                for(size_t j = 0; j < packedCmpResult.length(); ++j){
+                    content += packedCmpResult[j].get_str() + " ";
+                }
+                //debug(content.c_str());
+            }
+            ret[i] = PackedCiphertext(Vector::encrypt_pack(packedCmpResult, 32, *crypto)).data.data.get_str();
+        }
+        return ret;
+    }
+
+    string SVM(const vector<string>& a, const vector<string>& b, size_t plaintext_bits = 100){
+        vector<Vec<Integer>> ma(a.size());
+        vector<Vec<Integer>> mb(a.size());
+        size_t numIntegerPerCiphertext = Vector::pack_count(plaintext_bits, *(this->crypto));
+        Integer ret = 0;
+        for(size_t i = 0; i < a.size(); ++i){
+            PackedCiphertext pa(Integer(a[i].c_str()), numIntegerPerCiphertext, plaintext_bits);
+            PackedCiphertext pb(Integer(b[i].c_str()), numIntegerPerCiphertext, plaintext_bits);
+            ma[i] = Vector::decrypt_pack(pa, *(this->crypto));
+            mb[i] = Vector::decrypt_pack(pb, *(this->crypto));
+            for(size_t j = 0; j < ma[i].length(); ++j){
+                ret += (ma[i][j] - Integer(2).pow(plaintext_bits - 1)) * (mb[i][j] - Integer(2).pow(plaintext_bits - 1));
+            }
+        }
+        return crypto->encrypt(ret).data.get_str();
+    }
+
+    // encoding enc key into morton code
+    string SE(vector<string>&& keyStr){
+        size_t dim = keyStr.size();
+        vector<uint32_t> key(dim);
+        for(size_t i = 0; i < dim; ++i){
+            key[i] = crypto->decrypt(Ciphertext(Integer(keyStr[i].c_str()))).to_uint();
+        }
+        uint64_t val;
+        switch(dim){
+            case 2:{
+                val = morton_code<2, int(64 / 2)>::encode(std::array<uint32_t, 2>{key[0], key[1]});
+                break;
+            }
+            case 3:{
+                val = morton_code<3, int(64 / 3)>::encode(std::array<uint32_t, 3>{key[0], key[1], key[2]});
+                break;
+            }
+            case 4:{
+                val = morton_code<4, int(64 / 4)>::encode(std::array<uint32_t, 4>{key[0], key[1], key[2], key[3]});
+                break;
+            }
+            case 5:{
+                val = morton_code<5, int(64 / 5)>::encode(std::array<uint32_t, 5>{key[0], key[1], key[2], key[3], key[4]});
+                break;
+            }
+            case 6:{
+                val = morton_code<6, int(64 / 6)>::encode(std::array<uint32_t, 6>{key[0], key[1], key[2], key[3], key[4], key[5]});
+                break;
+            }
+        }
+        return crypto->encrypt(val).data.get_str();
+    }
+    /*****************************************************************************************************/
+    /**********************************************end****************************************************/
+    /*****************************************************************************************************/
 
 public:
     PaillierFast* crypto;
@@ -1100,7 +1320,8 @@ public:
     // actually recv how many data items and index nodes
     map<string, std::atomic<size_t>> name2count;
 
-
+    // threshold of search range
+    size_t threshold;
 };
 
 class DAP : public rpc_server{
@@ -1115,6 +1336,7 @@ public:
         this->register_handler("DEC", &DAP::DEC, this);
         this->register_handler("SVC", &DAP::SVC, this);
         this->register_handler("SVM", &DAP::SVM, this);
+        this->register_handler("SE", &DAP::SE, this);
     }
 
 
@@ -1144,39 +1366,6 @@ public:
         return crypto->decrypt(Integer(c.c_str())).get_str();
     }
 
-    // packed SIC
-    // vector<string> SVC(rpc_conn conn, const vector<string>& C){
-    //     vector<Integer> M(C.size());
-    //     for(size_t i = 0; i < C.size(); ++i){
-    //         M[i] = crypto->decrypt(Ciphertext(Integer(C[i].c_str())));            
-    //         if(M[i] < 0){
-    //             M[i] = -M[i];
-    //         }
-    //     }
-
-    //     size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
-        
-    //     vector<string> ret(M.size());
-
-    //     mpz_class mp_;
-    //     mp_.set_str("ffffffff", 16);
-    //     Integer mask(mp_);
-    //     for(size_t i = 0; i < M.size(); ++i){
-    //         Integer packedCmpResult = 0;
-    //         for(size_t j = 0; j < numIntegerPerCiphertext; ++j){
-    //             Integer m((M[i] >> (j * 32)) & mask);
-    //             m -= Integer(2).pow(32 - 1);
-    //             m %= crypto->get_pub().n;
-    //             Integer u = 0;
-    //             if(getMaxBitLength(m) > getMaxBitLength(crypto->get_pub().n) / 2){
-    //                 u = 1;
-    //             }
-    //             packedCmpResult |= (u << j*32);
-    //         }
-    //         ret[i] = crypto->encrypt(packedCmpResult).data.get_str();
-    //     }
-    //     return ret;
-    // }
     vector<string> SVC(rpc_conn conn, const vector<string>& C){
         //debug("call SVC from %s", conn.lock()->remote_address().c_str());
         //printf("call SVC from %s", conn.lock()->remote_address().c_str());
@@ -1231,6 +1420,39 @@ public:
             }
         }
         return crypto->encrypt(ret).data.get_str();
+    }
+
+    // encoding enc key into morton code
+    string SE(rpc_conn conn, vector<string>&& keyStr){
+        size_t dim = keyStr.size();
+        vector<uint32_t> key(dim);
+        for(size_t i = 0; i < dim; ++i){
+            key[i] = crypto->decrypt(Ciphertext(Integer(keyStr[i].c_str()))).to_uint();
+        }
+        uint64_t val;
+        switch(dim){
+            case 2:{
+                val = morton_code<2, int(64 / 2)>::encode(std::array<uint32_t, 2>{key[0], key[1]});
+                break;
+            }
+            case 3:{
+                val = morton_code<3, int(64 / 3)>::encode(std::array<uint32_t, 3>{key[0], key[1], key[2]});
+                break;
+            }
+            case 4:{
+                val = morton_code<4, int(64 / 4)>::encode(std::array<uint32_t, 4>{key[0], key[1], key[2], key[3]});
+                break;
+            }
+            case 5:{
+                val = morton_code<5, int(64 / 5)>::encode(std::array<uint32_t, 5>{key[0], key[1], key[2], key[3], key[4]});
+                break;
+            }
+            case 6:{
+                val = morton_code<6, int(64 / 6)>::encode(std::array<uint32_t, 6>{key[0], key[1], key[2], key[3], key[4], key[5]});
+                break;
+            }
+        }
+        return crypto->encrypt(val).data.get_str();
     }
 
 public:
@@ -1358,7 +1580,7 @@ public:
         out.close();
         info("save done\n");
     }
-    CA(const string& filePath) : rpc_server(config::CA_PORT, 1){
+    CA(const string& filePath) : rpc_server(config::CA_PORT, 1), crypto(nullptr){
         readKeys(filePath);
         this->register_handler("getKeySize", &CA::getKeySize, this);
         this->register_handler("getPub", &CA::getPub, this);
@@ -1382,6 +1604,7 @@ public:
         PublicKey pk(keySize, Integer(param.first.c_str()), Integer(param.second.c_str()));
         PrivateKey sk(keySize, std::stoul(param2[0]), Integer(param2[1].c_str()), Integer(param2[2].c_str()), Integer(param2[3].c_str()));
 
+        if(crypto) delete crypto;
         crypto = new PaillierFast(pk, sk);
         info("read done\n");
     }

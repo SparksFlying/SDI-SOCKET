@@ -115,10 +115,10 @@ public:
 		}
 		internLog(toWideString(content), level);
 
-		// if(level == logging::trivial::severity_level::debug)
-		// {
-		// 	std::cout << content << std::endl;
-		// }
+		if(level == logging::trivial::severity_level::debug)
+		{
+			std::cout << content << std::endl;
+		}
 	}
 
 	inline std::wstring toWideString(const std::string& input)

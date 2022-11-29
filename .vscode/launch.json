@@ -9,7 +9,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/experiment",
-            "args": ["do"],
+            "args": ["au", "car", "2", "10000", "0.01"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

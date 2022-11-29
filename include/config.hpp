@@ -10,6 +10,7 @@ namespace config{
     const string logFolder = workspaceFolder + "/log";
     const string dataFolder = workspaceFolder + "/data";
     const string queryFolder = workspaceFolder + "/query";
+    const string keysFolder = workspaceFolder + "/keys";
     constexpr uint32_t KEY_SIZE = 1024;
     constexpr size_t EPSILON = 64;
     constexpr uint64_t SIZE = 1000;
@@ -24,8 +25,8 @@ namespace config{
     };
 
     constexpr size_t FLOAT_EXP = 30;
-    constexpr size_t NUM_THREADS = 4;
-    constexpr size_t NUM_ONE_BATCH = 100;
+    constexpr size_t NUM_THREADS = 6;
+    constexpr size_t NUM_ONE_BATCH = 124;
     constexpr bool LOG = false;
     constexpr bool PARAL = true;
 
