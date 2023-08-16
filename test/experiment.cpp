@@ -22,7 +22,7 @@ std::map<string, string> nametrans{
 
 void initCA(int argc, char* argv[]){
     Log::instance("CA").setLevel(logging::trivial::severity_level::debug);
-    Entity::CA ca(config::keysFolder + "/" + string(argv[2]) + "-bit");
+    Entity::CA ca(argc > 2 ? std::stoi(string(argv[2])) : config::KEY_SIZE);
     ca.run();
 }
 
