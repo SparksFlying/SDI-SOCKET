@@ -6,7 +6,7 @@ using std::map;
 using std::string;
 
 namespace config{
-    const string workspaceFolder = "/home/zanglang/source/SDI";
+    const string workspaceFolder = "."; // fill the actual folder path
     const string logFolder = workspaceFolder + "/log";
     const string dataFolder = workspaceFolder + "/data";
     const string queryFolder = workspaceFolder + "/query";
