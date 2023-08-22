@@ -35,7 +35,7 @@ The `test/experiment.cpp` file shows how to run the environment what SDI needed,
 ./experiment do car 2 20000
 ```
 
-6. Run AU to send query requests to the server DSP via:
+6. Run AU and send query requests to the server DSP via:
 ```
 ./experiment au car 2 20000 0.005
 ```
