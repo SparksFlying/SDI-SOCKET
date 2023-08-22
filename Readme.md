@@ -8,7 +8,7 @@ git clone https://github.com/SparksFlying/SDI-SOCKET.git
 
 and copy the `include/pgm` directory to your system's or project's include path.
                                                                           
-The `test/experiment.cpp` file shows how to run the environment what SDI needed, it contains four entities: DSP (i.e., $C_{1}$), DAP (i.e., $C_{2}$), CA, DO and AU.
+The `test/experiment.cpp` file shows how to run the environment required for SDI. It contains four entities: DSP (i.e., $C_{1}$), DAP (i.e., $C_{2}$), CA, DO and AU.
 
 1. Run CA via:
 ```
