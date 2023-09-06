@@ -57,43 +57,48 @@ enum STATUS{
     DUPLICATE
 };
 
-static TimerClock tc;
+// static TimerClock tc;
 
 
 template<uint32_t dim = 2>
 class DO : public rpc_server{
 public:
-    using node_t=interval_tree_t<uint64_t>::node_type;
+    using node_t = interval_tree_t<uint64_t>::node_type;
     string dataName;
     vector<record<dim>> data_;
-    size_t epsilon_ = config::EPSILON;
+    size_t epsilon_ = config::EPSILON; // error-bound
     PaillierFast* crypto;
-    std::map<size_t, uint64_t> mortonTable_;
+    std::unordered_map<size_t, uint64_t> mortonTable_; // id -> morton code
     vector<node_t*> plainIndex;
 
     // place inserted new items
-    vector<pair<uint64_t, record<dim>>> buffer;
-    // 对端通信实体
+    vector<pair<uint64_t, record<dim>>> buffer; // vector of <morton code, record item>
+    // comm clients
     rpc_client dap_;
     rpc_client dsp_;
 
-    //std::set<std::shared_ptr<AU>> users_;
-
     DO(const string& dataName, vector<record<dim>>&& data, int port = 10001, int thread_num = config::NUM_THREADS): rpc_server(port, thread_num), data_(data), crypto(nullptr), dsp_(config::DSP_IP, config::DSP_PORT), dataName(dataName){
         
-        // sort data according its morton code
+        // calc records' morton code, take 'id' as primary key
         for(record<dim> item : data) {
             mortonTable_[item.id] = morton_code<dim, int(64/dim)>::encode(item.key);
         }
-
+        
+        // sort data according its morton code
         std::sort(data_.begin(), data_.end(), [this](const record<dim>& a, const record<dim>& b){
             return this->mortonTable_[a.id] < this->mortonTable_[b.id];
         });
 
-        // 接收秘钥
+        // recv paillier key
         recvKeys();
+
+        // set props of dsp
+        dsp_.set_connect_timeout(1000 * 100);
     }
-    DO(const string& dataName, vector<vector<uint32_t>>&& data, int port = 10001, int thread_num = config::NUM_THREADS): DO(dataName, convert<dim>(std::forward<vector<vector<uint32_t>>&&>(data))){}
+    DO(const string& dataName, vector<vector<uint32_t>>&& data, int port = 10001, int thread_num = config::NUM_THREADS): DO(dataName, convert<dim>(std::forward<vector<vector<uint32_t>>&&>(data))){
+        // TO DO
+    }
+    
     // 分块序列化加密数据
     vector<pair<pair<size_t, size_t>, string>> seriEncData(vector<pair<size_t, vector<string>>>& encData, const size_t blockSize = MAX_BUF_LEN - 10)
     {
@@ -145,12 +150,6 @@ public:
 
     void outSource()
     {
-        //debug("do outsource start");
-        {
-            tc.update();
-            auto idx = buildIndex();
-            info("data size is %lu, build index cost %.3f", this->data_.size(), tc.getTimerMilliSec());
-        }
         vector<pair<pair<size_t, size_t>, string>> encDataBlocks;
         vector<pair<pair<size_t, size_t>, string>> indexBlocks;
         {
@@ -172,6 +171,9 @@ public:
             //debug("encData seri %lu blocks", encDataBlocks.size());
             indexBlocks = seriIndex(index);
             //debug("index seri %lu blocks", indexBlocks.size());
+
+            // saveData(config::dataFolder + "/" + dataName + ".dat", encData);
+            // saveIndex(config::dataFolder + "/" + dataName + ".idx", index);
         }
         
 
@@ -192,14 +194,16 @@ public:
         {
             futs[i + encDataBlocks.size()] = dsp_.async_call<FUTURE>("recvIndex", dataName, indexBlocks[i]);
         }
+
+        // wait until finish
         for(auto& fut: futs){
             fut.get();
         }
-        //debug("do outsource end");
+        info("DO outsource end");
     }
 
     vector<pair<size_t, vector<string>>> encryptData(){
-        vector<pair<size_t, vector<string>>> encData(this->data_.size());
+        vector<pair<size_t, vector<string>>> encData(this->data_.size()); // pair<id, vector<string of integer>>
         for(size_t i = 0; i < encData.size(); ++i){
             encData[i].first = this->data_[i].id;
             encData[i].second.resize(dim);
@@ -209,14 +213,48 @@ public:
         }
         return encData;
     }
+
+    void saveData(const string& filePath, vector<pair<size_t, vector<string>>>& encData){
+        std::ofstream out(filePath, std::ios::out | std::ios::binary);
+        if(!out.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        out << encData.size() << ' ' << dim << ' ';
+
+
+        std::for_each(encData.begin(), encData.end(), [&out, this](const pair<size_t, vector<string>>& item){
+            out << item.first << ' ';
+            for(size_t i = 0; i < item.second.size(); ++i){
+                out << item.second[i] << ' ';
+            }
+        });
+        out.close();
+    }
+
+    void saveIndex(const string& filePath, vector<string>& index){
+        std::ofstream out(filePath, std::ios::out | std::ios::binary);
+        if(!out.is_open()){
+            info("open %s failed!", filePath.c_str());
+            return;
+        }
+        out << index.size() << ' ';
+
+        for(size_t i = 0; i < index.size(); ++i){
+            out << seriEncSegmentNode(*deSeriEncSegmentNode(index[i])) << ' ';
+        }
+        
+        out.close();
+    }
+
     vector<string> buildIndex(){
-        // 构建树
+        // build segment nodes
         std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, linearModel>>>> segNodes = buildTree();
 
-        // 填充
+        // padding nodes and make them a binary tree
         plainIndex = paddingIntervaltree(segNodes);
 
-        // 加密
+        // encrypt
         return encryptIntervaltree(plainIndex);
     }
 
@@ -225,13 +263,12 @@ public:
         for(size_t idx = 0; idx < data_.size(); ++idx){
             keys[idx] = mortonTable_[data_[idx].id];
         }
+
         vector<segment<uint64_t, size_t, double>> segs = pgm::transform(keys, pgm::fit<int64_t, size_t>(keys, epsilon_));
         //vector<segment<uint64_t, size_t, double>> segs = shringkingCone<int64_t, size_t>(keys, epsilon_);
         //debug("size of fitting segments is %lu, epsilon is %lu", segs.size(), epsilon_);
-
         std::vector<pair<interval<uint64_t, closed>, std::shared_ptr<pair<linearModel, linearModel>>>> segNodes = paddingSegments(segs);
-        //debug("after padding, size of segNodes is %lu", segNodes.size());
-        
+
         return segNodes;
     }
 
@@ -275,6 +312,7 @@ public:
         }
         
         // 扩充为满二叉树的同时保留结点间关系
+        // make these nodes a binary tree
         uint64_t minv = 1;
         constexpr uint64_t maxv = (std::numeric_limits<uint64_t>::max)();
         std::default_random_engine e;
@@ -331,11 +369,21 @@ public:
 
     vector<string> encryptIntervaltree(const vector<interval_tree_t<uint64_t> ::node_type*>& nodevec){
         vector<string> encNodes(nodevec.size());
-
+        size_t mem = 0;
         // 加密并序列化节点参数
         for(size_t i = 0; i < encNodes.size(); ++i){
-            encNodes[i] = seriEncSegmentNode(encSegmentNode(*(this->crypto), nodevec[i]));
+            auto node = encSegmentNode(*(this->crypto), nodevec[i]);
+            mem += node.low_.data.size_bits() / 8;
+            mem += node.high_.data.size_bits() / 8;
+            mem += node.max_.data.size_bits() / 8;
+            mem += node.pred1.first.data.size_bits() / 8;
+            mem += node.pred1.second.data.size_bits() / 8;
+            mem += node.pred2.first.data.size_bits() / 8;
+            mem += node.pred2.second.data.size_bits() / 8;
+            // printEncSegmentNode(crypto, &node);
+            encNodes[i] = seriEncSegmentNode(node);
         }
+        // printf("mem=%lu\n", mem);
         return encNodes;
     }
 
@@ -352,58 +400,42 @@ public:
         info("recv keys from %s:%d", config::CA_IP.c_str(), config::CA_PORT);
     }
 
-    // template<class iterator>
-    // iterator upperBound(iterator first, iterator last, uint64_t val){
-    //     size_t len = std::distance(first, last);
-
-    //     while (len > 0)
-    //     {
-    //         size_t half = len >> 1;
-    //         iterator middle = first;
-    //         std::advance(middle, half);
-    //         if (val < mortonTable_[(*middle).id])
-    //             len = half;
-    //         else
-    //         {
-    //             first = middle;
-    //             ++first;
-    //             len = len - half - 1;
-    //         }
-    //     }
-    //     return first;
-    // }
-
+    // accord morton code 'val' calc its position
     size_t caculateNewId(uint64_t val){
         size_t idx = 0;
 
-        for(size_t i = 0; i < buffer.size(); ++i){
-            if(buffer[i].first < val) idx++;
-            else if(buffer[i].first == val){
-                return -1;
-            }
+        // for(size_t i = 0; i < buffer.size(); ++i){
+        //     if(buffer[i].first < val) idx++;
+        //     else if(buffer[i].first == val){
+        //         return -1; // repeat then return
+        //     }
+        // }
+
+        auto iter = std::lower_bound(data_.begin(), data_.end(), val, [this](const record<dim>& a, uint64_t val){
+            return this->mortonTable_[a.id] < val;
+        });
+
+        if(iter == data_.end()){
+            return data_.size();
         }
 
-        auto iter = std::lower_bound(data_.begin(), data_.end(), val, [this](decltype(data_.begin()) iter, const uint64_t& val){
-            if(val < this->mortonTable_[(*iter).id]){
-                return true;
-            }
-            return false;
-        });
-        if(this->mortonTable_[(*iter).id] == val){
-            return -1;
+        if(this->mortonTable_[iter->id] == val){
+            return -1; // repeat
         }
-        return idx + std::distance(data_.begin(), iter) + 1;
+
+        return iter - data_.begin();
     }
 
-    // find seg node idx which covers key
-    size_t search(uint64_t val){
+    // find seg node idx which covers key(morton code)
+    size_t searchSegNodeIdx(uint64_t val){
         size_t cur = 0;
         while(cur < plainIndex.size()){
             if(val >= plainIndex[cur]->low() && val <= plainIndex[cur]->high()){
                 break;
             }
 
-            if(val <= plainIndex[cur]->left()->max()){
+            if(!plainIndex[cur]->left()) return cur;
+            else if(val <= plainIndex[cur]->left()->max()){
                 cur = 2 * cur + 1;
             }else{
                 cur = 2 * cur + 2;
@@ -411,33 +443,70 @@ public:
         }
         return cur;
     }
+
     // insert k-v record
-    STATUS insert(const pair<array<uint32_t, dim>, void*> item){
-        uint64_t val = morton_code<dim, int(64/dim)>::encode(item.first);
-        // check duplicate
+    STATUS insert(const array<uint32_t, dim>& item){
+        uint64_t val = morton_code<dim, int(64/dim)>::encode(item);
+        // find item's position and check duplicate
         size_t dataIdx = caculateNewId(val);
         if(dataIdx == size_t(-1)){
             return DUPLICATE;
         }
 
-        // insert item into buffer
-        buffer.emplace({morton_code<dim, int(64/dim)>::encode(item.first), record<dim>{dataIdx, item.first, item.second}});
+        record<dim> newRecord{data_.size(), item};
+        this->mortonTable_[newRecord.id] = val;
+        data_.insert(data_.begin() + dataIdx, newRecord);
 
         // search affected segments
-        size_t nodeIdx = search(val);
+        size_t nodeIdx = searchSegNodeIdx(val);
+        // gen a new seg node
+        {
+            size_t leftDataIdx = dataIdx, rightDataIdx = dataIdx;
+            for(; leftDataIdx > 0 && this->mortonTable_[data_[leftDataIdx].id] > plainIndex[nodeIdx]->low(); --leftDataIdx);
+            for(; rightDataIdx < data_.size() && this->mortonTable_[data_[rightDataIdx].id] < plainIndex[nodeIdx]->high(); ++rightDataIdx);
+            
+            vector<int64_t> keys(rightDataIdx - leftDataIdx + 1);
+            for(size_t idx = 0; idx < keys.size(); ++idx){
+                keys[idx] = mortonTable_[data_[leftDataIdx + idx].id];
+            }
+
+            vector<segment<uint64_t, size_t, double>> segs = pgm::transform(keys, pgm::fit<int64_t, size_t>(keys, epsilon_));
+            size_t inc = 1;
+            while(segs.size() > 2){
+                segs = pgm::transform(keys, pgm::fit<int64_t, size_t>(keys, epsilon_ + inc));
+                inc *= 2;
+            }
+
+            node_t* newNode = new node_t(plainIndex[nodeIdx]->parent_, node_t::interval_type{plainIndex[nodeIdx]->low(), plainIndex[nodeIdx]->high()});
+            newNode->data_ptr = std::make_shared<pair<linearModel, linearModel>>(
+                    linearModel{segs[0].slope, Integer(segs[0].pos) - Integer(uint64_t(segs[0].slope * double(segs[0].start))) - Integer(leftDataIdx)},
+                    linearModel{segs[0].slope, Integer(segs[0].pos) - Integer(uint64_t(segs[0].slope * double(segs[0].start))) - Integer(leftDataIdx)}
+            );
+            newNode->left_ = plainIndex[nodeIdx]->left_;
+            newNode->right_ = plainIndex[nodeIdx]->right_;
+            if(plainIndex[nodeIdx]->parent_ && plainIndex[nodeIdx]->parent_->left_ == plainIndex[nodeIdx]){
+                plainIndex[nodeIdx]->parent_->left_ = newNode;
+            }else if(plainIndex[nodeIdx]->parent_ && plainIndex[nodeIdx]->parent_->right_ == plainIndex[nodeIdx]){
+                plainIndex[nodeIdx]->parent_->right_ = newNode;
+            }
+            auto old = plainIndex[nodeIdx];
+            plainIndex[nodeIdx] = newNode;
+            delete old;
+        }
 
         if(!dsp_.has_connected()){
             while(!dsp_.connect());
         }
 
-
-        int status = dsp_.call<int>("insert", item.first, dataIdx, nodeIdx);
+        pair<size_t, vector<string>> encItem(newRecord.id, vector<string>(dim)); // encrypt data item and pack it into a string
+        for(size_t i = 0; i < dim; ++i) encItem.second[i] = crypto->encrypt(Integer(newRecord.key[i])).data.get_str();
+        string seriEncSegNode = seriEncSegmentNode(encSegmentNode(*(this->crypto), plainIndex[nodeIdx]));
+        // info("before dsp insert");
+        int status = dsp_.call<int>("insert", dataName, dataIdx, encItem, nodeIdx, seriEncSegNode);
+        // info("after dsp insert");
         return STATUS(status);
     }
 
-    void del(){
-
-    }
 };
 
 class DSP : public rpc_server{
@@ -448,15 +517,13 @@ public:
         dap_.enable_auto_reconnect(true);
         dap_.enable_auto_heartbeat(true);
         while(!dap_.connect());
-
-        //load("car-unique");
-
-        //CAP(name2index["car-unique"], crypto->encrypt(859317976), 0);
+        info("connect to dap %s:%lu", config::DAP_IP.c_str(), config::DAP_PORT);
 
         this->threshold = std::thread::hardware_concurrency() * config::NUM_ONE_BATCH * 10;
 
         this->register_handler("recvData", &DSP::recvData, this);
         this->register_handler("recvIndex", &DSP::recvIndex, this);
+        this->register_handler("insert", &DSP::insert, this);
         this->register_handler("rangeQuery", &DSP::rangeQuery, this);
         this->register_handler("rangeQueryOpt", &DSP::rangeQueryOpt, this);
         this->register_handler("recvDataInfo", &DSP::recvDataInfo, this);
@@ -482,7 +549,7 @@ public:
         lock_guard g(m_n2d);
         this->name2data[dataName].resize(dataSize);
         // init delmap
-        this->name2delmap[dataName] = BitMap<uint64_t>(dataSize);
+        this->name2delmap[dataName] = BitMap<uint64_t>(dataSize + dataSize);
         auto iter = this->name2data[dataName].begin();
         for(size_t i = 0; i < dataSize; ++i, ++iter){
             iter->second.resize(dim);
@@ -505,7 +572,7 @@ public:
         for(size_t i = encData.first.first; i < encData.first.second; ++i, ++iter)
         {
             ss >> iter->first;
-            this->id2data[dataName][iter->first] = iter;
+            // this->id2data[dataName][iter->first] = iter;
             string buf;
             for(size_t j = 0; j < iter->second.size(); ++j){
                 ss >> buf;
@@ -514,7 +581,7 @@ public:
         }
         this->name2count[dataName] += encData.first.second - encData.first.first;
         if(name2count[dataName] == name2data[dataName].size() + name2index[dataName].size()){
-            std::cout << "recv done" << std::endl;
+            info("recv dataset %s from %s", dataName.c_str(), remoteIP.c_str());
             // check dat and index file exists
             save(dataName);
         }
@@ -536,13 +603,13 @@ public:
         {
             for(size_t i = index.first.first; i < index.first.second; ++i)
             {
-                printEncSegmentNode(crypto, this->name2index[dataName][i]);
+                printEncSegmentNode(crypto, this->name2index[dataName][i].get());
             }
         }
         this->name2count[dataName] += index.first.second - index.first.first;
 
         if(name2count[dataName] == name2data[dataName].size() + name2index[dataName].size()){
-            std::cout << "recv done" << std::endl;
+            info("recv dataset %s from %s", dataName.c_str(), remoteIP.c_str());
             // check dat and index file exists
             save(dataName);
         }
@@ -634,7 +701,7 @@ public:
         string str;
         for(size_t i = 0; i < size; ++i, ++iter){
             in >> iter->first;
-            id2data[dataName][iter->first] = iter;
+            // id2data[dataName][iter->first] = iter;
             iter->second.resize(dim);
             for(size_t j = 0; j < dim; ++j){
                 in >> str;
@@ -665,27 +732,29 @@ public:
         in.close();
     }
 
-    Ciphertext checkData(const string& dataName, const EQueryRectangle& QR, const size_t& id){
-        {
-            lock_guard g(m_n2dm);
-            if(name2delmap[dataName].test(id)) return crypto->encrypt(0);
-        }
+    Ciphertext checkData(const string& dataName, const EQueryRectangle& QR, const size_t& posIdx){
+        // {
+        //     lock_guard g(m_n2dm);
+        //     if(name2delmap[dataName].test(id)) return crypto->encrypt(0);
+        // }
         Ciphertext res = crypto->encrypt(0);
-        auto iter = this->id2data.find(dataName)->second.find(id)->second;
+        auto iter = this->name2data[dataName].begin();
+        std::advance(iter, posIdx);
         for(size_t i = 0; i < iter->second.size(); ++i){
-            Integer cmp = SM(SMinus(iter->second[i], QR.get_minvec()[i]), SMinus(iter->second[i], QR.get_maxvec()[i])).data;
-            res.data *= SIC(cmp.pow_mod_n(crypto->get_pub().n-1,*(crypto->get_n2())), crypto->encrypt(0)).data;
+            Ciphertext cmp = SM(SMinus(iter->second[i], QR.get_minvec()[i]), SMinus(iter->second[i], QR.get_maxvec()[i]));
+            res.data *= SIC(crypto->encrypt(0), cmp).data;
         }
         return res;
 	}
 
     size_t predict(const string& dataName, const Ciphertext& input, bool whichPred){
         Ciphertext encPos = CAP(name2index[dataName], input, whichPred);
-        // Integer pos(dap_.call<string>("DEC", encPos.data.get_str()).c_str());
-        Integer pos(this->DEC(encPos.data.get_str()).c_str());
+        Integer pos(dap_.call<string>("DEC", encPos.data.get_str()).c_str());
+        // Integer pos(this->DEC(encPos.data.get_str()).c_str());
 
         pos /= Integer(10).pow(config::FLOAT_EXP);
-        pos -= Integer(config::EPSILON);
+        if(whichPred == 0) pos -= Integer(config::EPSILON);
+        else pos += Integer(config::EPSILON);
         pos = pos < 0 ? 0 : pos;
         pos = pos < Integer(name2data[dataName].size()) ? pos : Integer(name2data[dataName].size()) - 1;
         return pos.to_ulong();
@@ -719,13 +788,13 @@ public:
         size_t dim = name2data[dataName].begin()->second.size();
         Vec<PackedCiphertext> packedCmpResult = fut.first.get();
         Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
-        debug("[%lu, %lu], cmp size = %lld", fut.second.first, fut.second.second, cmpResult.length());
+        // debug("[%lu, %lu], cmp size = %lld", fut.second.first, fut.second.second, cmpResult.length());
         for(size_t posIdx = fut.second.first; posIdx <= fut.second.second; ++posIdx){
             if(cmpResult[posIdx - fut.second.first] == 2 * dim){
                 results.push_back(posIdx);
             }
         }
-        debug("unpack done");
+        // debug("unpack done");
     }
 
     void split(const string& dataName, vector<pair<size_t, size_t>>& posInfos, const pair<size_t, size_t>& posInfo, const EQueryRectangle& EQR){
@@ -771,7 +840,7 @@ public:
     }
 
     pair<int, vector<size_t>> rangeQuery(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
-        info("recv request from %s", conn.lock()->remote_address().c_str());
+        info("recv query request from %s", conn.lock()->remote_address().c_str());
         if(!name2index.count(dataName)){
             return {NOSUCHDATA, {}};
         }
@@ -782,27 +851,112 @@ public:
         pair<Ciphertext, Ciphertext> encRange{Ciphertext(Integer(range.first.c_str())), Ciphertext(Integer(range.second.c_str()))};
         EQueryRectangle EQR(limits);
         // predict
+        // tc.update();
         pair<size_t, size_t> posInfo = predictRange(dataName, encRange);
-
+        // debug("first stage %.3f", tc.getTimerMilliSec());
         // result empty
         if(posInfo.first > posInfo.second)
         {
             return {SUCCESS, {}};
         }
 
-        debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+        // debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
 
         // if search range over threshold, then split, else pack search
         vector<size_t> results;
         if(posInfo.second - posInfo.first + 1 <= threshold){
             vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>> futs = genSearchTasks(dataName, posInfo, EQR);          
-            debug("gen done");
+            // debug("gen done");
             for(size_t i = 0; i < futs.size(); ++i){
                 unpack(results, futs[i], dataName);
             }
         }else{
             vector<pair<size_t, size_t>> posInfos;
-            split(dataName, posInfos, posInfo, EQR);
+            // split(dataName, posInfos, posInfo, EQR);
+            posInfos.emplace_back(posInfo.first, posInfo.second);
+            vector<vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>>> futs(posInfos.size());
+            for(size_t i = 0; i < posInfos.size(); ++i){
+                futs[i] = genSearchTasks(dataName, posInfos[i], EQR);
+            }
+            for(size_t i = 0; i < posInfos.size(); ++i){
+                for(size_t j = 0; j < futs[i].size(); ++j){
+                    unpack(results, futs[i][j], dataName);
+                }
+            }
+        }
+        pair<int, vector<size_t>> ret{SUCCESS, std::move(results)};
+        return ret;
+    }
+
+    pair<int, vector<size_t>> local_rangeQuery(const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        if(!name2index.count(dataName)){
+            return {NOSUCHDATA, {}};
+        }
+        if(name2count[dataName] != name2data[dataName].size() + name2index[dataName].size()){
+            return {NOTCOMPLATE, {}};
+        }
+
+        pair<Ciphertext, Ciphertext> encRange{Ciphertext(Integer(range.first.c_str())), Ciphertext(Integer(range.second.c_str()))};
+        EQueryRectangle EQR(limits);
+        // predict
+        // tc.update();
+        pair<size_t, size_t> posInfo = predictRange(dataName, encRange);
+        // debug("first stage %.3f, [%lu, %lu]", tc.getTimerMilliSec(), posInfo.first, posInfo.second);
+        // result empty
+        if(posInfo.first > posInfo.second)
+        {
+            return {SUCCESS, {}};
+        }
+
+        // debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+
+        // if search range over threshold, then split, else pack search
+        vector<size_t> results;
+        EQueryRectangle QR(limits);
+        size_t dim = limits.size() / 2;
+        for(size_t i = posInfo.first; i <= posInfo.second; ++i){
+            Ciphertext flag = checkData(dataName, QR, i);
+            int mf = Integer(this->DEC(flag.data.get_str()).c_str()).to_int();
+            if(mf == dim) results.push_back(i);
+        }
+        pair<int, vector<size_t>> ret{SUCCESS, std::move(results)};
+        return ret;
+    }
+
+    pair<int, vector<size_t>> local_rangeQueryOpt(const string& dataName, const pair<string, string>& range, const vector<string>& limits){
+        if(!name2index.count(dataName)){
+            return {NOSUCHDATA, {}};
+        }
+        if(name2count[dataName] != name2data[dataName].size() + name2index[dataName].size()){
+            return {NOTCOMPLATE, {}};
+        }
+
+        pair<Ciphertext, Ciphertext> encRange{Ciphertext(Integer(range.first.c_str())), Ciphertext(Integer(range.second.c_str()))};
+        EQueryRectangle EQR(limits);
+        // predict
+        // tc.update();
+        pair<size_t, size_t> posInfo = predictRange(dataName, encRange);
+        // debug("first stage %.3f", tc.getTimerMilliSec());
+        // result empty
+        if(posInfo.first > posInfo.second)
+        {
+            return {SUCCESS, {}};
+        }
+
+        // debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+
+        // if search range over threshold, then split, else pack search
+        vector<size_t> results;
+        if(posInfo.second - posInfo.first + 1 <= threshold){
+            vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>> futs = genSearchTasks(dataName, posInfo, EQR);          
+            // debug("gen done");
+            for(size_t i = 0; i < futs.size(); ++i){
+                unpack(results, futs[i], dataName);
+            }
+        }else{
+            vector<pair<size_t, size_t>> posInfos;
+            // split(dataName, posInfos, posInfo, EQR);
+            posInfos.emplace_back(posInfo.first, posInfo.second);
             vector<vector<pair<std::future<Vec<PackedCiphertext>>, pair<size_t, size_t>>>> futs(posInfos.size());
             for(size_t i = 0; i < posInfos.size(); ++i){
                 futs[i] = genSearchTasks(dataName, posInfos[i], EQR);
@@ -864,7 +1018,7 @@ public:
     }
 
     pair<int, vector<size_t>> rangeQueryOpt(rpc_conn conn, const string& dataName, const pair<string, string>& range, const vector<string>& limits){
-        info("recv request from %s", conn.lock()->remote_address().c_str());
+        info("recv query request from %s", conn.lock()->remote_address().c_str());
         if(!name2index.count(dataName)){
             return {NOSUCHDATA, {}};
         }
@@ -884,10 +1038,10 @@ public:
             encPosInfo.second = CAP(name2index[dataName], Ciphertext(Integer(range.second.c_str())), 1);
         }
 
-        // Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
-        // Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
-        Integer startPos(this->DEC(encPosInfo.first.data.get_str()).c_str());
-        Integer endPos(this->DEC(encPosInfo.second.data.get_str()).c_str());
+        Integer startPos(dap_.call<string>("DEC", encPosInfo.first.data.get_str()).c_str());
+        Integer endPos(dap_.call<string>("DEC", encPosInfo.second.data.get_str()).c_str());
+        // Integer startPos(this->DEC(encPosInfo.first.data.get_str()).c_str());
+        // Integer endPos(this->DEC(encPosInfo.second.data.get_str()).c_str());
 
         
         //debug("predict posinfo = [%s, %s]", (startPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str(), (endPos / Integer(10).pow(config::FLOAT_EXP)).get_str().c_str());
@@ -904,7 +1058,7 @@ public:
         }
         pair<size_t, size_t> posInfo{startPos.to_ulong(), endPos.to_ulong()};
 
-        debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
+        // debug("search range is [%lu, %lu]", posInfo.first, posInfo.second);
         // result empty
         if(posInfo.first > posInfo.second)
         {
@@ -920,6 +1074,17 @@ public:
             futs[i] = std::async(&DSP::packSearching, this, dataName, splitedPosInfo[i], EQR);
         }
 
+        // vector<size_t> results{};
+        // size_t dim = name2data[dataName].begin()->second.size();
+        // for(size_t i = 0; i < numTasks; ++i){
+        //     Vec<PackedCiphertext> packedCmpResult = futs[i].get();
+        //     Vec<Integer> cmpResult = Vector::decrypt_pack(packedCmpResult, *crypto);
+        //     for(size_t posIdx = splitedPosInfo[i].first; posIdx <= splitedPosInfo[i].second; ++posIdx){
+        //         if(cmpResult[posIdx - splitedPosInfo[i].first] == 2 * dim){
+        //             results.push_back(posIdx);
+        //         }
+        //     }
+        // }
         vector<size_t> results{};
         size_t dim = name2data[dataName].begin()->second.size();
         for(size_t i = 0; i < numTasks; ++i){
@@ -937,18 +1102,22 @@ public:
     }
 
     // insert an item
-    int insert(rpc_conn conn, const string& dataName, pair<size_t, vector<string>>&& item, const size_t& posIdx, const size_t& segIdx){
-        std::lock(m_n2d, m_i2d);
+    // posIdx: position to insert the item
+    // item: <id, vector<Integer>>
+    // segIdx: idx of segment node
+    // seriEncSegNode: replace the origin 'idx' th segment node
+    int insert(rpc_conn conn, const string& dataName, const size_t& posIdx, pair<size_t, vector<string>>&& item, const size_t& segIdx, const string& seriEncSegNode){
+        // std::lock(m_n2d, m_i2d);
         pair<size_t, vector<Ciphertext>> tmp{item.first, vector<Ciphertext>(item.second.size())};
         for(size_t i = 0; i < tmp.second.size(); ++i) tmp.second[i] = Integer(item.second[i].c_str());
         auto iter = name2data[dataName].begin();
         std::advance(iter, posIdx);
         auto newIter = name2data[dataName].insert(iter, std::move(tmp));
-        id2data[dataName][item.first] = newIter;
-        
+        // info("insert item success");
         // update index nodes
+        name2index[dataName][segIdx].reset(deSeriEncSegmentNode(seriEncSegNode));
         updateNodes(dataName, segIdx);
-
+        // info("update success");
         name2count[dataName]++;
         return SUCCESS;
     }
@@ -984,8 +1153,8 @@ public:
         Integer rb = r.rand_int(crypto->get_pub().n);
         Ciphertext tmp_a=crypto->encrypt(ra).data * a.data;
         Ciphertext tmp_b=crypto->encrypt(rb).data * b.data;
-        // Ciphertext h = Integer(dap_.call<string>("SM", tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
-        Ciphertext h = Integer(this->SM(tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
+        Ciphertext h = Integer(dap_.call<string>("SM", tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
+        // Ciphertext h = Integer(this->SM(tmp_a.data.get_str(), tmp_b.data.get_str()).c_str());
 
         auto s = h.data * a.data.pow_mod_n(crypto->get_pub().n - rb, *crypto->get_n2());
         auto tmp_s = s * b.data.pow_mod_n(crypto->get_pub().n - ra, *crypto->get_n2());
@@ -1026,8 +1195,8 @@ public:
         Integer r = Random::instance().rand_int(crypto->get_pub().n - 1) % (Integer(2).pow(maxBitLength)) + 1;
         Ciphertext c = _times(Z, r);
 
-        // Ciphertext ret = Integer(dap_.call<string>("SIC", c.data.get_str()).c_str());
-        Ciphertext ret = Integer(this->SIC(c.data.get_str()).c_str());
+        Ciphertext ret = Integer(dap_.call<string>("SIC", c.data.get_str()).c_str());
+        // Ciphertext ret = Integer(this->SIC(c.data.get_str()).c_str());
         if(coin == 0){
             ret = SMinus(crypto->encrypt(1), ret);
         }
@@ -1079,8 +1248,8 @@ public:
         for(size_t i = 0; i < C.size(); ++i){
             seriC[i] = C[i].data.data.get_str();
         }
-        // vector<string> packedCmpResult = dap_.call<vector<string>>("SVC", seriC);
-        vector<string> packedCmpResult = this->SVC(seriC);
+        vector<string> packedCmpResult = dap_.call<vector<string>>("SVC", seriC);
+        // vector<string> packedCmpResult = this->SVC(seriC);
 
         //debug("call dap SVC finish");
 
@@ -1115,8 +1284,8 @@ public:
         Integer r = Random::instance().rand_int(crypto->get_pub().n) % Integer(2);
         Ciphertext f = SM(SMinus(crypto->encrypt(1), F), pf).data * SM(F, crypto->encrypt(r)).data;
 
-        // Integer ret(dap_.call<string>("DEC", f.data.get_str().c_str()) .c_str());
-        Integer ret(this->DEC(f.data.get_str().c_str()).c_str());
+        Integer ret(dap_.call<string>("DEC", f.data.get_str().c_str()) .c_str());
+        // Integer ret(this->DEC(f.data.get_str().c_str()).c_str());
         return ret == 0 ? RIGHT : LEFT;
     }
 
@@ -1157,14 +1326,14 @@ public:
             seriPackedB[i] = packedB[i].data.data.get_str();
         }
 
-        // string tmp = dap_.call<string>("SVM", seriPackedA, seriPackedB, plaintext_bits);
-        string tmp = this->SVM(seriPackedA, seriPackedB, plaintext_bits);
+        string tmp = dap_.call<string>("SVM", seriPackedA, seriPackedB, plaintext_bits);
+        // string tmp = this->SVM(seriPackedA, seriPackedB, plaintext_bits);
         return Integer(tmp.c_str());
     }
 
     Ciphertext divide(const Ciphertext& a, int b){
-        // string tmp = dap_.call<string>("DEC", a.data.get_str());
-        string tmp = this->DEC(a.data.get_str());
+        string tmp = dap_.call<string>("DEC", a.data.get_str());
+        // string tmp = this->DEC(a.data.get_str());
         return crypto->encrypt(Integer(tmp.c_str()) / b);
     }
     Ciphertext encode(const vector<Ciphertext>& key){
@@ -1172,8 +1341,8 @@ public:
         for(size_t i = 0; i < key.size(); ++i){
             keyStr[i] = key[i].data.get_str();
         }
-        // string tmp = dap_.call<string>("SE", keyStr);
-        string tmp = this->SE(std::move(keyStr));
+        string tmp = dap_.call<string>("SE", keyStr);
+        // string tmp = this->SE(std::move(keyStr));
         return Ciphertext(Integer(tmp.c_str()));
     }
 
@@ -1181,28 +1350,32 @@ public:
     // to exactly calc time of computing (without communication time and cost), move DAP's functions to DSP
     /*****************************************************************************************************/
     string SM(const string& a, const string& b){
-        //debug("call SM from %s", conn.lock()->remote_address().c_str());
-        //printf("call SM from %s", conn.lock()->remote_address().c_str());
+        communicationCost += Integer(a.c_str()).size_bits();
+        communicationCost += Integer(b.c_str()).size_bits();
+
         Integer ha = crypto->decrypt(Integer(a.c_str()) % *crypto->get_n2());
         Integer hb = crypto->decrypt(Integer(b.c_str()) % *crypto->get_n2());
         Integer h = (ha * hb) % crypto->get_pub().n;
-        return crypto->encrypt(h).data.get_str();
+
+        Ciphertext ret = crypto->encrypt(h);
+        communicationCost += ret.data.size_bits();
+        return ret.data.get_str();
     }
 
     string SIC(const string& c){
-        //debug("call SIC from %s", conn.lock()->remote_address().c_str());
-        //printf("call SIC from %s", conn.lock()->remote_address().c_str());
+        communicationCost += Integer(c.c_str()).size_bits();
         Integer m = crypto->decrypt(Ciphertext(Integer(c.c_str()))) % crypto->get_pub().n;
         Integer u = 0;
         if(getMaxBitLength(m >= 0 ? m : -m) > getMaxBitLength(crypto->get_pub().n) / 2){
             u = 1;
         }
-        return crypto->encrypt(u).data.get_str();
+        Ciphertext ret = crypto->encrypt(u);
+        communicationCost += ret.data.size_bits();
+        return ret.data.get_str();
     }
 
     string DEC(const string& c){
-        //debug("call DEC from %s", conn.lock()->remote_address().c_str());
-        //printf("call DEC from %s", conn.lock()->remote_address().c_str());
+        communicationCost += Integer(c.c_str()).size_bits();
         return crypto->decrypt(Integer(c.c_str())).get_str();
     }
 
@@ -1213,16 +1386,17 @@ public:
         vector<string> ret(M.size());
         size_t numIntegerPerCiphertext = Vector::pack_count(32, *(this->crypto));
         for(size_t i = 0; i < C.size(); ++i){
+            communicationCost += Integer(C[i].c_str()).size_bits();
             PackedCiphertext packed(Integer(C[i].c_str()), numIntegerPerCiphertext, 32);
             M[i] = Vector::decrypt_pack(packed, *(this->crypto));
 
-            if(config::LOG){
-                string content;
-                for(size_t j = 0; j < M[i].length(); ++j){
-                    content += (M[i][j] - Integer(2).pow(32 - 1)).get_str() + " ";
-                }
-                //debug(content.c_str());
-            }
+            // if(config::LOG){
+            //     string content;
+            //     for(size_t j = 0; j < M[i].length(); ++j){
+            //         content += (M[i][j] - Integer(2).pow(32 - 1)).get_str() + " ";
+            //     }
+            //     //debug(content.c_str());
+            // }
 
             Vec<Integer> packedCmpResult(NTL::INIT_SIZE_TYPE{}, M[i].length(), 0);
             for(size_t j = 0; j < numIntegerPerCiphertext; ++j){
@@ -1241,6 +1415,7 @@ public:
                 //debug(content.c_str());
             }
             ret[i] = PackedCiphertext(Vector::encrypt_pack(packedCmpResult, 32, *crypto)).data.data.get_str();
+            communicationCost += Integer(ret[i].c_str()).size_bits();
         }
         return ret;
     }
@@ -1298,6 +1473,70 @@ public:
     /**********************************************end****************************************************/
     /*****************************************************************************************************/
 
+
+    void query(const string& dataName, const QueryRectangle<uint32_t>& QR){
+        pair<uint64_t, uint64_t> range{};
+        vector<string> limits(QR.dim * 2);
+
+        switch(QR.dim){
+            case 2:{
+                range.first = morton_code<2, 32>::encode(vec2arr<uint32_t, 2>(QR.get_minvec()));
+                range.second = morton_code<2, 32>::encode(vec2arr<uint32_t, 2>(QR.get_maxvec()));
+                break;
+            }
+            case 3:{
+                range.first = morton_code<3, 21>::encode(vec2arr<uint32_t, 3>(QR.get_minvec()));
+                range.second = morton_code<3, 21>::encode(vec2arr<uint32_t, 3>(QR.get_maxvec()));
+                break;
+            }
+            case 4:{
+                range.first = morton_code<4, 16>::encode(vec2arr<uint32_t, 4>(QR.get_minvec()));
+                range.second = morton_code<4, 16>::encode(vec2arr<uint32_t, 4>(QR.get_maxvec()));
+                break;
+            }
+            case 5:{
+                range.first = morton_code<5, 12>::encode(vec2arr<uint32_t, 5>(QR.get_minvec()));
+                range.second = morton_code<5, 12>::encode(vec2arr<uint32_t, 5>(QR.get_maxvec()));
+                break;
+            }
+            case 6:{
+                range.first = morton_code<6, 10>::encode(vec2arr<uint32_t, 6>(QR.get_minvec()));
+                range.second = morton_code<6, 10>::encode(vec2arr<uint32_t, 6>(QR.get_maxvec()));
+                break;
+            }
+        }
+
+        // encrypt
+
+        for(size_t i = 0; i < QR.dim; ++i){
+            limits[i] = crypto->encrypt(QR.get_minvec()[i]).data.get_str();
+            limits[i + QR.dim] = crypto->encrypt(QR.get_maxvec()[i]).data.get_str();
+        }
+        pair<string, string> encRange{crypto->encrypt(range.first).data.get_str(), crypto->encrypt(range.second).data.get_str()};
+        
+        static TimerClock tc;
+        tc.update();
+
+        communicationCost = 0;
+        pair<int, vector<size_t>> res = this->local_rangeQueryOpt(dataName, encRange, limits);
+        debug("comm cost:%lu\n", communicationCost);
+        switch(res.first){
+            case SUCCESS:{
+                // std::cout << "query result size is " << res.second.size() << std::endl;
+                info("result size is %lu, time cost is %.3f ms", res.second.size(), tc.getTimerMilliSec());
+                break;
+            }
+            case NOSUCHDATA:{
+                std::cout << "no such dataset " << std::endl;
+                break;
+            }
+            case NOTCOMPLATE:{
+                std::cout << "not complate " << std::endl;
+                break;
+            }
+        }
+    }
+
 public:
     PaillierFast* crypto;
     rpc_client dap_;
@@ -1307,7 +1546,7 @@ public:
     // dataname to index
     map<string, vector<shared_ptr<encSegmentNode>>> name2index;
     // data id to iterator of data: id -> iterator of data item
-    map<string, map<size_t, list<pair<size_t, vector<Ciphertext>>>::iterator>> id2data;
+    // map<string, map<size_t, list<pair<size_t, vector<Ciphertext>>>::iterator>> id2data;
     // bitmap for deleted flags: id -> {0, 1} (1 represents deleted)
     map<string, BitMap<uint64_t>> name2delmap;
 
@@ -1322,6 +1561,9 @@ public:
 
     // threshold of search range
     size_t threshold;
+
+    // communication cost
+    size_t communicationCost = 0;
 };
 
 class DAP : public rpc_server{
@@ -1341,7 +1583,7 @@ public:
 
 
     string SM(rpc_conn conn, const string& a, const string& b){
-        //debug("call SM from %s", conn.lock()->remote_address().c_str());
+        info("call SM from %s", conn.lock()->remote_address().c_str());
         //printf("call SM from %s", conn.lock()->remote_address().c_str());
         Integer ha = crypto->decrypt(Integer(a.c_str()) % *crypto->get_n2());
         Integer hb = crypto->decrypt(Integer(b.c_str()) % *crypto->get_n2());
@@ -1350,7 +1592,7 @@ public:
     }
 
     string SIC(rpc_conn conn, const string& c){
-        //debug("call SIC from %s", conn.lock()->remote_address().c_str());
+        info("call SIC from %s", conn.lock()->remote_address().c_str());
         //printf("call SIC from %s", conn.lock()->remote_address().c_str());
         Integer m = crypto->decrypt(Ciphertext(Integer(c.c_str()))) % crypto->get_pub().n;
         Integer u = 0;
@@ -1367,7 +1609,7 @@ public:
     }
 
     vector<string> SVC(rpc_conn conn, const vector<string>& C){
-        //debug("call SVC from %s", conn.lock()->remote_address().c_str());
+        info("call SVC from %s", conn.lock()->remote_address().c_str());
         //printf("call SVC from %s", conn.lock()->remote_address().c_str());
         vector<Vec<Integer>> M(C.size());
         vector<string> ret(M.size());
@@ -1530,13 +1772,13 @@ public:
         //auto fut = dsp_.async_call<FUTURE>("rangeQuery", dataName, encRange, limits);
         // vector<size_t> res = fut.get().as<vector<size_t>>();
 
-        dsp_.set_connect_timeout(1000 * 10);
+        dsp_.set_connect_timeout(1000 * 1000);
         static TimerClock tc;
         tc.update();
         pair<int, vector<size_t>> res = dsp_.call<pair<int, vector<size_t>>>("rangeQuery", dataName, encRange, limits);
         switch(res.first){
             case SUCCESS:{
-                std::cout << "query result size is " << res.second.size() << std::endl;
+                // std::cout << "query result size is " << res.second.size() << std::endl;
                 info("result size is %lu, time cost is %.3f", res.second.size(), tc.getTimerMilliSec());
                 break;
             }
